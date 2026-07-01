@@ -1,0 +1,37 @@
+## User-specific files
+*.rsuser
+*.suo
+*.user
+*.useruser
+*.userosscache
+*.sln.docstates
+
+## Build results
+[Dd]ebug/
+[Dd]ebugPS/
+[Rr]elease/
+[Rr]eleasePS/
+x64/
+x86/
+[Aa]rm/
+[Aa]rm64/
+bld/
+[Bb]in/
+[Oo]bj/
+[Cc]ache/
+
+## Visual Studio 2015/2017/2019/2022/2025/2026 cache directories
+.vs/
+
+## Secrets and local configuration
+# Descomenta la siguiente línea si no quieres subir las cadenas de conexión locales
+# appsettings.Development.json
+
+## Rider / JetBrains / VS Code
+.idea/
+.vscode/
+
+## OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini

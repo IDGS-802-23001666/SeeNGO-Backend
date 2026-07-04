@@ -1,4 +1,9 @@
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using System.Text;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.IdentityModel.Tokens;
 using MongoDB.Bson;
 using MongoDB.Bson.Serialization.Attributes;
 using MongoDB.Bson.Serialization.Conventions;
@@ -17,10 +22,32 @@ builder.Services.AddScoped(sp =>
     return client.GetDatabase(mongoSettings["DatabaseName"]);
 });
 
+var jwtSettings = builder.Configuration.GetSection("Jwt");
+var secretKey = Encoding.UTF8.GetBytes(jwtSettings["SecretKey"]!);
+
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidateAudience = true,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            ValidIssuer = jwtSettings["Issuer"],
+            ValidAudience = jwtSettings["Audience"],
+            IssuerSigningKey = new SymmetricSecurityKey(secretKey)
+        };
+    });
+
+builder.Services.AddAuthorization();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
 var app = builder.Build();
+
+app.UseAuthentication();
+app.UseAuthorization();
 
 if (app.Environment.IsDevelopment())
 {
@@ -386,7 +413,7 @@ app.MapGet("/api/users/{id}", async (string id, IMongoDatabase db) =>
 
     var user = await userCollection.Find(u => u.Id == objectId).Project(u => new
     {
-        u.Id, u.Name, u.Email, u.Role, u.CreatedAt
+        u.Id, u.Name, u.Email, u.Phone, u.Role, u.CreatedAt
     }).FirstOrDefaultAsync();
 
     return user is not null
@@ -402,8 +429,12 @@ app.MapPut("/api/users/{id}", async (string id, [FromBody] UpdateProfileDto dto,
     if (!ObjectId.TryParse(id, out var objectId))
         return Results.BadRequest(new { message = "ID inv\u00e1lido." });
 
-    var update = Builders<UserDocument>.Update.Set(u => u.Name, dto.Name);
-    var result = await userCollection.UpdateOneAsync(u => u.Id == objectId, update);
+    var updateBuilder = Builders<UserDocument>.Update.Set(u => u.Name, dto.Name);
+    if (dto.Phone is not null)
+        updateBuilder = updateBuilder.Set(u => u.Phone, dto.Phone);
+    if (dto.Email is not null)
+        updateBuilder = updateBuilder.Set(u => u.Email, dto.Email);
+    var result = await userCollection.UpdateOneAsync(u => u.Id == objectId, updateBuilder);
     return result.ModifiedCount > 0
         ? Results.Ok(new { message = "Perfil actualizado." })
         : Results.NotFound(new { message = "Usuario no encontrado." });
@@ -814,6 +845,241 @@ app.MapGet("/api/health", async (IMongoDatabase db) =>
 })
 .WithName("HealthCheck");
 
+// ==========================================
+// NEW: ADMIN SUMMARY ENDPOINT
+// ==========================================
+
+app.MapGet("/api/admin/summary", async (IMongoDatabase db) =>
+{
+    var userCollection = db.GetCollection<UserDocument>("users");
+    var deviceCollection = db.GetCollection<DeviceDocument>("devices");
+    var raspberryCollection = db.GetCollection<RaspberryDocument>("raspberries");
+
+    var usuariosActivos = await userCollection.CountDocumentsAsync(FilterDefinition<UserDocument>.Empty);
+    var dispositivosRegistrados = await deviceCollection.CountDocumentsAsync(FilterDefinition<DeviceDocument>.Empty);
+    var alertasPendientes = await raspberryCollection.CountDocumentsAsync(
+        Builders<RaspberryDocument>.Filter.Ne(r => r.Status, "online")
+    );
+
+    return Results.Ok(new
+    {
+        usuariosActivos,
+        dispositivosRegistrados,
+        alertasPendientes
+    });
+})
+.WithName("GetAdminSummary");
+
+// ==========================================
+// NEW: ANALYTICS DEVICE-USAGE ENDPOINT
+// ==========================================
+
+app.MapGet("/api/analytics/device-usage", async ([FromQuery] string? userId, [FromQuery] string? period, IMongoDatabase db) =>
+{
+    var sessionCollection = db.GetCollection<UserSessionDocument>("user_sessions");
+
+    var daysBack = period switch
+    {
+        "week" => 7,
+        "month" => 30,
+        "year" => 365,
+        _ => 7
+    };
+
+    var since = DateTime.UtcNow.AddDays(-daysBack).ToString("yyyy-MM-dd");
+
+    FilterDefinition<UserSessionDocument> filter;
+    if (!string.IsNullOrEmpty(userId))
+        filter = Builders<UserSessionDocument>.Filter.And(
+            Builders<UserSessionDocument>.Filter.Eq(s => s.UserId, userId),
+            Builders<UserSessionDocument>.Filter.Gte(s => s.DateString, since)
+        );
+    else
+        filter = Builders<UserSessionDocument>.Filter.Gte(s => s.DateString, since);
+
+    var sessions = await sessionCollection.Find(filter).SortBy(s => s.DateString).ToListAsync();
+
+    var dailyGroups = sessions.GroupBy(s => s.DateString).OrderBy(g => g.Key);
+
+    var dates = new List<string>();
+    var frequencies = new List<int>();
+    var kwhData = new List<double>();
+
+    foreach (var group in dailyGroups)
+    {
+        dates.Add(group.Key);
+        var totalEvents = group.Sum(s => s.DeviceHistory.Count);
+        var totalKwh = group.Sum(s => s.DeviceHistory.Sum(d => d.KwhConsumed));
+        frequencies.Add(totalEvents);
+        kwhData.Add(Math.Round(totalKwh, 2));
+    }
+
+    var allLogs = sessions.SelectMany(s => s.DeviceHistory).ToList();
+    var hourlyGroups = allLogs.GroupBy(d => d.Timestamp.Hour).OrderBy(g => g.Key);
+
+    var hours = new List<string>();
+    var hourlyFrequencies = new List<int>();
+
+    for (int h = 0; h < 24; h++)
+    {
+        hours.Add(h.ToString("D2"));
+        var match = hourlyGroups.FirstOrDefault(g => g.Key == h);
+        hourlyFrequencies.Add(match?.Count() ?? 0);
+    }
+
+    var deviceTypes = allLogs
+        .GroupBy(d => d.DeviceType)
+        .Select(g => new { name = g.Key, count = g.Count() })
+        .ToList();
+
+    return Results.Ok(new
+    {
+        dates,
+        frequencies,
+        kwhData,
+        hours,
+        hourlyFrequencies,
+        deviceTypes,
+        totalSessions = sessions.Count,
+        totalEvents = allLogs.Count,
+        period = period ?? "week"
+    });
+})
+.WithName("GetDeviceUsage");
+
+// ==========================================
+// NEW: RASPBERRY MONITOR ENDPOINT
+// ==========================================
+
+app.MapGet("/api/monitor/raspberries", async (IMongoDatabase db) =>
+{
+    var raspberryCollection = db.GetCollection<RaspberryDocument>("raspberries");
+
+    var raspberries = await raspberryCollection.Find(FilterDefinition<RaspberryDocument>.Empty)
+        .SortByDescending(r => r.LastSeen)
+        .ToListAsync();
+
+    var result = raspberries.Select(r => new
+    {
+        id = r.Id.ToString(),
+        userId = r.UserId ?? "unknown",
+        name = r.Name,
+        localIp = r.LocalIp,
+        contact = r.Contact ?? "",
+        status = r.Status == "online" ? "Online" : "Offline",
+        cpuUsage = r.CpuUsage,
+        ramUsage = r.RamUsage,
+        storageUsage = r.StorageUsage,
+        uptime = r.Uptime,
+        lastSeen = r.LastSeen
+    });
+
+    return Results.Ok(result);
+})
+.WithName("GetMonitorRaspberries");
+
+// ==========================================
+// NEW: USER PROFILE ENDPOINTS (JWT-based)
+// ==========================================
+
+app.MapGet("/api/users/profile", async (HttpContext httpContext, IMongoDatabase db) =>
+{
+    var userId = httpContext.User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+    if (userId is null)
+        return Results.Unauthorized();
+
+    var userCollection = db.GetCollection<UserDocument>("users");
+
+    if (!ObjectId.TryParse(userId, out var objectId))
+        return Results.BadRequest(new { message = "ID de usuario inv\u00e1lido." });
+
+    var user = await userCollection.Find(u => u.Id == objectId)
+        .Project(u => new
+        {
+            u.Id, u.Name, u.Email, u.Phone, u.Role, u.CreatedAt
+        })
+        .FirstOrDefaultAsync();
+
+    return user is not null
+        ? Results.Ok(user)
+        : Results.NotFound(new { message = "Usuario no encontrado." });
+})
+.WithName("GetMyProfile")
+.RequireAuthorization();
+
+app.MapPut("/api/users/profile", async (HttpContext httpContext, [FromBody] UpdateProfileDto dto, IMongoDatabase db) =>
+{
+    var userId = httpContext.User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+    if (userId is null)
+        return Results.Unauthorized();
+
+    var userCollection = db.GetCollection<UserDocument>("users");
+
+    if (!ObjectId.TryParse(userId, out var objectId))
+        return Results.BadRequest(new { message = "ID de usuario inv\u00e1lido." });
+
+    var updateBuilder = Builders<UserDocument>.Update.Set(u => u.Name, dto.Name);
+    if (dto.Phone is not null)
+        updateBuilder = updateBuilder.Set(u => u.Phone, dto.Phone);
+    if (dto.Email is not null)
+        updateBuilder = updateBuilder.Set(u => u.Email, dto.Email);
+
+    var result = await userCollection.UpdateOneAsync(u => u.Id == objectId, updateBuilder);
+    return result.ModifiedCount > 0
+        ? Results.Ok(new { message = "Perfil actualizado exitosamente." })
+        : Results.NotFound(new { message = "Usuario no encontrado." });
+})
+.WithName("UpdateMyProfile")
+.RequireAuthorization();
+
+app.MapDelete("/api/users/profile", async (HttpContext httpContext, IMongoDatabase db) =>
+{
+    var userId = httpContext.User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+    if (userId is null)
+        return Results.Unauthorized();
+
+    var userCollection = db.GetCollection<UserDocument>("users");
+
+    if (!ObjectId.TryParse(userId, out var objectId))
+        return Results.BadRequest(new { message = "ID de usuario inv\u00e1lido." });
+
+    var result = await userCollection.DeleteOneAsync(u => u.Id == objectId);
+    return result.DeletedCount > 0
+        ? Results.Ok(new { message = "Cuenta eliminada exitosamente." })
+        : Results.NotFound(new { message = "Usuario no encontrado." });
+})
+.WithName("DeleteMyProfile")
+.RequireAuthorization();
+
+// ==========================================
+// NEW: USER DEVICES ENDPOINT (JWT-based)
+// ==========================================
+
+app.MapGet("/api/users/devices", async (HttpContext httpContext, IMongoDatabase db) =>
+{
+    var userId = httpContext.User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+    if (userId is null)
+        return Results.Unauthorized();
+
+    var deviceCollection = db.GetCollection<DeviceDocument>("devices");
+
+    var devices = await deviceCollection.Find(d => d.UserId == userId).ToListAsync();
+
+    return Results.Ok(new
+    {
+        total = devices.Count,
+        devicesOnline = devices.Count(d => d.IsOnline),
+        devicesOn = devices.Count(d => d.IsOn),
+        data = devices.Select(d => new
+        {
+            d.Id, d.UserId, d.MacAddress, d.LocalIp, d.DeviceType,
+            d.DisplayName, d.Room, d.Icon, d.IsOnline, d.IsOn, d.CreatedAt
+        })
+    });
+})
+.WithName("GetMyDevices")
+.RequireAuthorization();
+
 app.Run();
 
 // ==========================================
@@ -880,7 +1146,11 @@ public record ResetPasswordDto(
     string NewPassword
 );
 
-public record UpdateProfileDto(string Name);
+public record UpdateProfileDto(
+    string Name,
+    string? Phone = null,
+    string? Email = null
+);
 
 public record CreateRoutineDto(
     string UserId,
@@ -989,6 +1259,7 @@ public class UserDocument
     public ObjectId Id { get; set; }
     public string Name { get; set; } = null!;
     public string Email { get; set; } = null!;
+    public string? Phone { get; set; }
     public string PasswordHash { get; set; } = null!;
     public string Role { get; set; } = "client";
     public string? ResetCode { get; set; }
@@ -1047,8 +1318,10 @@ public class RaspberryDocument
     [BsonId]
     [BsonRepresentation(BsonType.ObjectId)]
     public ObjectId Id { get; set; }
+    public string? UserId { get; set; }
     public string Name { get; set; } = null!;
     public string LocalIp { get; set; } = null!;
+    public string? Contact { get; set; }
     public string Status { get; set; } = "online";
     public double CpuUsage { get; set; }
     public double RamUsage { get; set; }
@@ -1075,8 +1348,33 @@ public static class JwtHelper
 {
     public static string GenerateToken(string userId, string email, string role)
     {
-        var key = new System.Text.StringBuilder();
-        key.Append("SeeNGO-SecretKey-2024-Minimum32Characters!");
-        return $"mock_token_{userId}_{role}";
+        var jwtSettings = new ConfigurationBuilder()
+            .SetBasePath(Directory.GetCurrentDirectory())
+            .AddJsonFile("appsettings.json")
+            .Build()
+            .GetSection("Jwt");
+
+        var secretKey = Encoding.UTF8.GetBytes(jwtSettings["SecretKey"]!);
+        var expirationHours = int.Parse(jwtSettings["ExpirationHours"] ?? "24");
+
+        var claims = new[]
+        {
+            new Claim(ClaimTypes.NameIdentifier, userId),
+            new Claim(ClaimTypes.Email, email),
+            new Claim(ClaimTypes.Role, role)
+        };
+
+        var token = new JwtSecurityToken(
+            issuer: jwtSettings["Issuer"],
+            audience: jwtSettings["Audience"],
+            claims: claims,
+            expires: DateTime.UtcNow.AddHours(expirationHours),
+            signingCredentials: new SigningCredentials(
+                new SymmetricSecurityKey(secretKey),
+                SecurityAlgorithms.HmacSha256
+            )
+        );
+
+        return new JwtSecurityTokenHandler().WriteToken(token);
     }
 }

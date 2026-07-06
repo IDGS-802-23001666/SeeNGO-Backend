@@ -15,7 +15,7 @@ builder.Services.AddCors(options =>
 {
     options.AddPolicy("SeenGoCorsPolicy", policy =>
     {
-        policy.WithOrigins("http://localhost:4200") 
+        policy.WithOrigins("http://localhost:4200", "https://seengo.up.railway.app")
               .AllowAnyMethod()                     
               .AllowAnyHeader();                    
     });

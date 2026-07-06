@@ -11,6 +11,16 @@ using MongoDB.Driver;
 
 var builder = WebApplication.CreateBuilder(args);
 
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("SeenGoCorsPolicy", policy =>
+    {
+        policy.WithOrigins("http://localhost:4200") 
+              .AllowAnyMethod()                     
+              .AllowAnyHeader();                    
+    });
+});
+
 var conventionPack = new ConventionPack { new IgnoreIfNullConvention(true) };
 ConventionRegistry.Register("SeenGoConventions", conventionPack, t => true);
 
@@ -46,6 +56,8 @@ builder.Services.AddSwaggerGen();
 
 var app = builder.Build();
 
+app.UseCors("SeenGoCorsPolicy");
+app.UseHttpsRedirection();
 app.UseAuthentication();
 app.UseAuthorization();
 

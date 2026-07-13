@@ -8,6 +8,7 @@ using MongoDB.Bson;
 using MongoDB.Bson.Serialization.Attributes;
 using MongoDB.Bson.Serialization.Conventions;
 using MongoDB.Driver;
+using Google.Apis.Auth;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -411,6 +412,50 @@ app.MapPost("/api/auth/reset-password", async ([FromBody] ResetPasswordDto dto, 
     return Results.Ok(new { message = "Contrase\u00f1a restablecida exitosamente." });
 })
 .WithName("ResetPassword");
+
+app.MapPost("/api/auth/google", async ([FromBody] GoogleAuthDto dto, IMongoDatabase db, IConfiguration config) =>
+{
+    var userCollection = db.GetCollection<UserDocument>("users");
+
+    try
+    {
+        var settings = new GoogleJsonWebSignature.ValidationSettings()
+        {
+            Audience = new[] { config["GoogleClientId"] }
+        };
+
+        var payload = await GoogleJsonWebSignature.ValidateAsync(dto.IdToken, settings);
+
+        var user = await userCollection.Find(u => u.Email == payload.Email).FirstOrDefaultAsync();
+
+        if (user is null)
+        {
+            user = new UserDocument
+            {
+                Name = payload.Name, 
+                Email = payload.Email,
+                PasswordHash = "[GOOGLE_AUTH]",
+                Role = "client",
+                CreatedAt = DateTime.UtcNow
+            };
+
+            await userCollection.InsertOneAsync(user);
+        }
+
+        var token = JwtHelper.GenerateToken(user.Id.ToString(), user.Email, user.Role);
+
+        return Results.Ok(new
+        {
+            token,
+            user = new { user.Id, user.Name, user.Email, user.Role }
+        });
+    }
+    catch (InvalidJwtException)
+    {
+        return Results.Unauthorized();
+    }
+})
+.WithName("GoogleLogin");
 
 // ==========================================
 // USER PROFILE ENDPOINTS
@@ -1211,6 +1256,8 @@ public record SpotifyTokenDto(
     DateTime ExpiresAt
 );
 
+public record GoogleAuthDto(string IdToken);
+
 // ==========================================
 // DOCUMENT MODELS (MongoDB Collections)
 // ==========================================
@@ -1268,7 +1315,7 @@ public class UserDocument
 {
     [BsonId]
     [BsonRepresentation(BsonType.ObjectId)]
-    public ObjectId Id { get; set; }
+    public string? Id { get; set; }
     public string Name { get; set; } = null!;
     public string Email { get; set; } = null!;
     public string? Phone { get; set; }

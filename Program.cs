@@ -465,12 +465,15 @@ app.MapGet("/api/users/{id}", async (string id, IMongoDatabase db) =>
 {
     var userCollection = db.GetCollection<UserDocument>("users");
 
-    if (!ObjectId.TryParse(id, out var objectId))
-        return Results.BadRequest(new { message = "ID inv\u00e1lido." });
-
-    var user = await userCollection.Find(u => u.Id == objectId).Project(u => new
+    // Ya no hacemos TryParse, comparamos directamente u.Id con id
+    var user = await userCollection.Find(u => u.Id == id).Project(u => new
     {
-        u.Id, u.Name, u.Email, u.Phone, u.Role, u.CreatedAt
+        u.Id,
+        u.Name,
+        u.Email,
+        u.Phone,
+        u.Role,
+        u.CreatedAt
     }).FirstOrDefaultAsync();
 
     return user is not null
@@ -483,15 +486,15 @@ app.MapPut("/api/users/{id}", async (string id, [FromBody] UpdateProfileDto dto,
 {
     var userCollection = db.GetCollection<UserDocument>("users");
 
-    if (!ObjectId.TryParse(id, out var objectId))
-        return Results.BadRequest(new { message = "ID inv\u00e1lido." });
-
     var updateBuilder = Builders<UserDocument>.Update.Set(u => u.Name, dto.Name);
     if (dto.Phone is not null)
         updateBuilder = updateBuilder.Set(u => u.Phone, dto.Phone);
     if (dto.Email is not null)
         updateBuilder = updateBuilder.Set(u => u.Email, dto.Email);
-    var result = await userCollection.UpdateOneAsync(u => u.Id == objectId, updateBuilder);
+
+    // Igual aquí, actualizamos directo donde u.Id sea igual a id
+    var result = await userCollection.UpdateOneAsync(u => u.Id == id, updateBuilder);
+
     return result.ModifiedCount > 0
         ? Results.Ok(new { message = "Perfil actualizado." })
         : Results.NotFound(new { message = "Usuario no encontrado." });
@@ -1050,7 +1053,7 @@ app.MapGet("/api/users/profile", async (HttpContext httpContext, IMongoDatabase 
     if (!ObjectId.TryParse(userId, out var objectId))
         return Results.BadRequest(new { message = "ID de usuario inv\u00e1lido." });
 
-    var user = await userCollection.Find(u => u.Id == objectId)
+    var user = await userCollection.Find(u => u.Id == userId)
         .Project(u => new
         {
             u.Id, u.Name, u.Email, u.Phone, u.Role, u.CreatedAt
@@ -1081,7 +1084,7 @@ app.MapPut("/api/users/profile", async (HttpContext httpContext, [FromBody] Upda
     if (dto.Email is not null)
         updateBuilder = updateBuilder.Set(u => u.Email, dto.Email);
 
-    var result = await userCollection.UpdateOneAsync(u => u.Id == objectId, updateBuilder);
+    var result = await userCollection.UpdateOneAsync(u => u.Id == userId, updateBuilder);
     return result.ModifiedCount > 0
         ? Results.Ok(new { message = "Perfil actualizado exitosamente." })
         : Results.NotFound(new { message = "Usuario no encontrado." });
@@ -1100,7 +1103,7 @@ app.MapDelete("/api/users/profile", async (HttpContext httpContext, IMongoDataba
     if (!ObjectId.TryParse(userId, out var objectId))
         return Results.BadRequest(new { message = "ID de usuario inv\u00e1lido." });
 
-    var result = await userCollection.DeleteOneAsync(u => u.Id == objectId);
+    var result = await userCollection.DeleteOneAsync(u => u.Id == userId);
     return result.DeletedCount > 0
         ? Results.Ok(new { message = "Cuenta eliminada exitosamente." })
         : Results.NotFound(new { message = "Usuario no encontrado." });

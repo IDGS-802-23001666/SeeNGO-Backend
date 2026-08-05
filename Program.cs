@@ -906,7 +906,7 @@ app.MapGet("/api/health", async (IMongoDatabase db) =>
 .WithName("HealthCheck");
 
 // ==========================================
-// NEW: ADMIN SUMMARY ENDPOINT
+// ADMIN SUMMARY ENDPOINT
 // ==========================================
 
 app.MapGet("/api/admin/summary", async (IMongoDatabase db) =>
@@ -931,7 +931,7 @@ app.MapGet("/api/admin/summary", async (IMongoDatabase db) =>
 .WithName("GetAdminSummary");
 
 // ==========================================
-// NEW: ANALYTICS DEVICE-USAGE ENDPOINT
+// ANALYTICS DEVICE-USAGE ENDPOINT
 // ==========================================
 
 app.MapGet("/api/analytics/device-usage", async ([FromQuery] string? userId, [FromQuery] string? period, IMongoDatabase db) =>
@@ -1008,7 +1008,7 @@ app.MapGet("/api/analytics/device-usage", async ([FromQuery] string? userId, [Fr
 .WithName("GetDeviceUsage");
 
 // ==========================================
-// NEW: RASPBERRY MONITOR ENDPOINT
+// RASPBERRY MONITOR ENDPOINT
 // ==========================================
 
 app.MapGet("/api/monitor/raspberries", async (IMongoDatabase db) =>
@@ -1039,7 +1039,7 @@ app.MapGet("/api/monitor/raspberries", async (IMongoDatabase db) =>
 .WithName("GetMonitorRaspberries");
 
 // ==========================================
-// NEW: USER PROFILE ENDPOINTS (JWT-based)
+// USER PROFILE ENDPOINTS (JWT-based)
 // ==========================================
 
 app.MapGet("/api/users/profile", async (HttpContext httpContext, IMongoDatabase db) =>
@@ -1112,7 +1112,7 @@ app.MapDelete("/api/users/profile", async (HttpContext httpContext, IMongoDataba
 .RequireAuthorization();
 
 // ==========================================
-// NEW: USER DEVICES ENDPOINT (JWT-based)
+// USER DEVICES ENDPOINT (JWT-based)
 // ==========================================
 
 app.MapGet("/api/users/devices", async (HttpContext httpContext, IMongoDatabase db) =>
@@ -1140,11 +1140,94 @@ app.MapGet("/api/users/devices", async (HttpContext httpContext, IMongoDatabase 
 .WithName("GetMyDevices")
 .RequireAuthorization();
 
+
+
+// ==========================================
+// STORE / VENTAS ENDPOINTS
+// ==========================================
+
+// 1. Obtener todos los productos del catálogo
+app.MapGet("/api/productos", async (IMongoDatabase db) =>
+{
+    var collection = db.GetCollection<ProductoDocument>("productos");
+    var productos = await collection.Find(FilterDefinition<ProductoDocument>.Empty).ToListAsync();
+    return Results.Ok(productos);
+})
+.WithName("GetProductos");
+
+// 2. Agregar una nueva venta (Extrae el UserId del Token JWT)
+app.MapPost("/api/ventas", async (HttpContext httpContext, [FromBody] CreateVentaDto dto, IMongoDatabase db) =>
+{
+    // Obtenemos el ID del usuario directamente de su sesión
+    var userId = httpContext.User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+    if (userId is null) return Results.Unauthorized();
+
+    var ventasCollection = db.GetCollection<VentaDocument>("ventas");
+
+    var nuevaVenta = new VentaDocument
+    {
+        UserId = userId,
+        Items = dto.Items.Select(i => new VentaItem
+        {
+            ProductoId = i.ProductoId,
+            NombreProducto = i.NombreProducto,
+            Cantidad = i.Cantidad,
+            PrecioUnitario = i.PrecioUnitario
+        }).ToList(),
+        Total = dto.Items.Sum(i => i.Cantidad * i.PrecioUnitario), // Calcula el total automáticamente
+        FechaVenta = DateTime.UtcNow
+    };
+
+    await ventasCollection.InsertOneAsync(nuevaVenta);
+    return Results.Created($"/api/ventas/{nuevaVenta.Id}", nuevaVenta);
+})
+.WithName("CreateVenta")
+.RequireAuthorization(); // <- Requiere estar logueado
+
+// 3. Obtener solo las compras/ventas del propio usuario
+app.MapGet("/api/ventas/mis-ventas", async (HttpContext httpContext, IMongoDatabase db) =>
+{
+    var userId = httpContext.User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+    if (userId is null) return Results.Unauthorized();
+
+    var ventasCollection = db.GetCollection<VentaDocument>("ventas");
+
+    // Filtramos para que solo vea las de su propio ID
+    var misVentas = await ventasCollection.Find(v => v.UserId == userId)
+        .SortByDescending(v => v.FechaVenta)
+        .ToListAsync();
+
+    return Results.Ok(misVentas);
+})
+.WithName("GetMisVentas")
+.RequireAuthorization(); // <- Requiere estar logueado
+
+// 4. Obtener TODAS las ventas realizadas en general (Para el panel de Admin)
+app.MapGet("/api/ventas", async (IMongoDatabase db) =>
+{
+    var ventasCollection = db.GetCollection<VentaDocument>("ventas");
+    var todasLasVentas = await ventasCollection.Find(FilterDefinition<VentaDocument>.Empty)
+        .SortByDescending(v => v.FechaVenta)
+        .ToListAsync();
+
+    return Results.Ok(todasLasVentas);
+})
+.WithName("GetAllVentas");
+
 app.Run();
 
 // ==========================================
 // DTOs (Data Transfer Objects)
 // ==========================================
+
+public record CreateVentaDto(List<CreateVentaItemDto> Items);
+
+public record CreateVentaItemDto(
+    string ProductoId,
+    string NombreProducto,
+    int Cantidad,
+    double PrecioUnitario
+);
 
 public record DeviceEventDto(
     string UserId,
@@ -1391,6 +1474,38 @@ public class RaspberryDocument
     public string Uptime { get; set; } = null!;
     public DateTime LastSeen { get; set; }
     public DateTime CreatedAt { get; set; }
+}
+
+public class ProductoDocument
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+    public string Nombre { get; set; } = null!;
+    public string Descripcion { get; set; } = null!;
+    public double Precio { get; set; }
+    public int Stock { get; set; }
+    public DateTime CreatedAt { get; set; }
+}
+
+public class VentaDocument
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+    public string UserId { get; set; } = null!;
+    public List<VentaItem> Items { get; set; } = new();
+    public double Total { get; set; }
+    public DateTime FechaVenta { get; set; }
+}
+
+public class VentaItem
+{
+    public string ProductoId { get; set; } = null!;
+    public string NombreProducto { get; set; } = null!;
+    public int Cantidad { get; set; }
+    public double PrecioUnitario { get; set; }
+    public double Subtotal => Cantidad * PrecioUnitario;
 }
 
 public static class BCryptHelper

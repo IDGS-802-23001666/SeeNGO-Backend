@@ -9,6 +9,7 @@ using MongoDB.Bson.Serialization.Attributes;
 using MongoDB.Bson.Serialization.Conventions;
 using MongoDB.Driver;
 using Google.Apis.Auth;
+using Microsoft.OpenApi;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -53,7 +54,33 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
 
 builder.Services.AddAuthorization();
 builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen();
+builder.Services.AddSwaggerGen(c =>
+{
+    c.AddSecurityDefinition("Bearer", new Microsoft.OpenApi.Models.OpenApiSecurityScheme
+    {
+        Name = "Authorization",
+        Type = Microsoft.OpenApi.Models.SecuritySchemeType.ApiKey,
+        Scheme = "Bearer",
+        BearerFormat = "JWT",
+        In = Microsoft.OpenApi.Models.ParameterLocation.Header,
+        Description = "Ingresa 'Bearer' [espacio] y luego tu token.\n\nEjemplo: \"Bearer eyJhbGci...\""
+    });
+
+    c.AddSecurityRequirement(new Microsoft.OpenApi.Models.OpenApiSecurityRequirement
+    {
+        {
+            new Microsoft.OpenApi.Models.OpenApiSecurityScheme
+            {
+                Reference = new Microsoft.OpenApi.Models.OpenApiReference
+                {
+                    Type = Microsoft.OpenApi.Models.ReferenceType.SecurityScheme,
+                    Id = "Bearer"
+                }
+            },
+            Array.Empty<string>()
+        }
+    });
+});
 
 var app = builder.Build();
 
@@ -363,7 +390,7 @@ app.MapPost("/api/auth/register", async ([FromBody] RegisterRequestDto dto, IMon
 })
 .WithName("RegisterUser");
 
-app.MapPost("/api/auth/login", async ([FromBody] LoginRequestDto dto, IMongoDatabase db) =>
+app.MapPost("/api/auth/login", async ([FromBody] LoginRequestDto dto, IMongoDatabase db, IConfiguration config) =>
 {
     var userCollection = db.GetCollection<UserDocument>("users");
 
@@ -371,7 +398,7 @@ app.MapPost("/api/auth/login", async ([FromBody] LoginRequestDto dto, IMongoData
     if (user is null || !BCryptHelper.VerifyPassword(dto.Password, user.PasswordHash))
         return Results.Unauthorized();
 
-    var token = JwtHelper.GenerateToken(user.Id.ToString(), user.Email, user.Role);
+    var token = JwtHelper.GenerateToken(user.Id.ToString(), user.Email, user.Role, config);
     return Results.Ok(new
     {
         token,
@@ -442,7 +469,7 @@ app.MapPost("/api/auth/google", async ([FromBody] GoogleAuthDto dto, IMongoDatab
             await userCollection.InsertOneAsync(user);
         }
 
-        var token = JwtHelper.GenerateToken(user.Id.ToString(), user.Email, user.Role);
+        var token = JwtHelper.GenerateToken(user.Id.ToString(), user.Email, user.Role, config);
 
         return Results.Ok(new
         {
@@ -1523,14 +1550,9 @@ public static class BCryptHelper
 
 public static class JwtHelper
 {
-    public static string GenerateToken(string userId, string email, string role)
+    public static string GenerateToken(string userId, string email, string role, IConfiguration configuration)
     {
-        var jwtSettings = new ConfigurationBuilder()
-            .SetBasePath(Directory.GetCurrentDirectory())
-            .AddJsonFile("appsettings.json")
-            .Build()
-            .GetSection("Jwt");
-
+        var jwtSettings = configuration.GetSection("Jwt");
         var secretKey = Encoding.UTF8.GetBytes(jwtSettings["SecretKey"]!);
         var expirationHours = int.Parse(jwtSettings["ExpirationHours"] ?? "24");
 

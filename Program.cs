@@ -1188,6 +1188,7 @@ app.MapGet("/api/users/devices", async (HttpContext httpContext, IMongoDatabase 
 // estos costos son la base para calcular el precio de los productos.
 // ==========================================
 
+// 1. Listar todos los materiales
 app.MapGet("/api/materiales", async (IMongoDatabase db) =>
 {
     var materialCollection = db.GetCollection<MaterialDocument>("materiales");
@@ -1199,6 +1200,7 @@ app.MapGet("/api/materiales", async (IMongoDatabase db) =>
 })
 .WithName("GetMateriales");
 
+// 2. Obtener un material por id
 app.MapGet("/api/materiales/{id}", async (string id, IMongoDatabase db) =>
 {
     var materialCollection = db.GetCollection<MaterialDocument>("materiales");
@@ -1210,6 +1212,7 @@ app.MapGet("/api/materiales/{id}", async (string id, IMongoDatabase db) =>
 })
 .WithName("GetMaterialById");
 
+// 3. Crear un material nuevo (ej: "Raspberry Pi 4", costo proveedor $850)
 app.MapPost("/api/materiales", async ([FromBody] CreateMaterialDto dto, IMongoDatabase db) =>
 {
     var materialCollection = db.GetCollection<MaterialDocument>("materiales");
@@ -1230,6 +1233,7 @@ app.MapPost("/api/materiales", async ([FromBody] CreateMaterialDto dto, IMongoDa
 .WithName("CreateMaterial")
 .RequireAuthorization();
 
+// 4. Actualizar un material (ej: cambia el precio del proveedor)
 app.MapPut("/api/materiales/{id}", async (string id, [FromBody] UpdateMaterialDto dto, IMongoDatabase db) =>
 {
     var materialCollection = db.GetCollection<MaterialDocument>("materiales");
@@ -1246,6 +1250,8 @@ app.MapPut("/api/materiales/{id}", async (string id, [FromBody] UpdateMaterialDt
     if (result.ModifiedCount == 0)
         return Results.NotFound(new { message = "Material no encontrado." });
 
+    // Como el costo del material cambió, recalculamos el precio de todos
+    // los productos que lo usan para que no queden desfasados.
     var productoCollection = db.GetCollection<ProductoDocument>("productos");
     var productosAfectados = await productoCollection
         .Find(p => p.Materiales.Any(mat => mat.MaterialId == id))
@@ -1286,6 +1292,7 @@ app.MapDelete("/api/materiales/{id}", async (string id, IMongoDatabase db) =>
 //   PrecioFinal = PrecioBruto * (1 + PorcentajeUtilidad / 100)
 // ==========================================
 
+// 1. Obtener todos los productos del catálogo (con su desglose de precio)
 app.MapGet("/api/productos", async (IMongoDatabase db) =>
 {
     var collection = db.GetCollection<ProductoDocument>("productos");
@@ -1296,6 +1303,7 @@ app.MapGet("/api/productos", async (IMongoDatabase db) =>
 })
 .WithName("GetProductos");
 
+// 1.1 Obtener un producto por id
 app.MapGet("/api/productos/{id}", async (string id, IMongoDatabase db) =>
 {
     var collection = db.GetCollection<ProductoDocument>("productos");
@@ -1307,6 +1315,8 @@ app.MapGet("/api/productos/{id}", async (string id, IMongoDatabase db) =>
 })
 .WithName("GetProductoById");
 
+// 2. Crear un producto a partir de su lista de materiales
+// Ejemplo: "Cigo" = 1 Raspberry + 1 Cámara + 1 ESP + 1 Impresión 3D, con 20% de utilidad
 app.MapPost("/api/productos", async ([FromBody] CreateProductoDto dto, IMongoDatabase db) =>
 {
     var materialCollection = db.GetCollection<MaterialDocument>("materiales");
@@ -1316,7 +1326,7 @@ app.MapPost("/api/productos", async ([FromBody] CreateProductoDto dto, IMongoDat
     if (error is not null)
         return Results.BadRequest(new { message = error });
 
-    var porcentajeUtilidad = dto.PorcentajeUtilidad ?? 20; 
+    var porcentajeUtilidad = dto.PorcentajeUtilidad ?? 20; // 20% por default si no se especifica
     var precioFinal = Math.Round(precioBruto * (1 + (porcentajeUtilidad / 100)), 2);
 
     var producto = new ProductoDocument
@@ -1337,6 +1347,7 @@ app.MapPost("/api/productos", async ([FromBody] CreateProductoDto dto, IMongoDat
 .WithName("CreateProducto")
 .RequireAuthorization();
 
+// 3. Actualizar un producto (materiales y/o % de utilidad); recalcula el precio
 app.MapPut("/api/productos/{id}", async (string id, [FromBody] UpdateProductoDto dto, IMongoDatabase db) =>
 {
     var materialCollection = db.GetCollection<MaterialDocument>("materiales");
@@ -1366,6 +1377,7 @@ app.MapPut("/api/productos/{id}", async (string id, [FromBody] UpdateProductoDto
 .WithName("UpdateProducto")
 .RequireAuthorization();
 
+// 3.1 Recalcular el precio de un producto (por si cambiaron costos de materiales)
 app.MapPost("/api/productos/{id}/recalcular", async (string id, IMongoDatabase db) =>
 {
     var materialCollection = db.GetCollection<MaterialDocument>("materiales");
@@ -1379,6 +1391,7 @@ app.MapPost("/api/productos/{id}/recalcular", async (string id, IMongoDatabase d
 .WithName("RecalcularPrecioProducto")
 .RequireAuthorization();
 
+// 4. Eliminar un producto
 app.MapDelete("/api/productos/{id}", async (string id, IMongoDatabase db) =>
 {
     var productoCollection = db.GetCollection<ProductoDocument>("productos");
@@ -1391,8 +1404,10 @@ app.MapDelete("/api/productos/{id}", async (string id, IMongoDatabase db) =>
 .WithName("DeleteProducto")
 .RequireAuthorization();
 
+// 5. Agregar una nueva venta (Extrae el UserId del Token JWT)
 app.MapPost("/api/ventas", async (HttpContext httpContext, [FromBody] CreateVentaDto dto, IMongoDatabase db) =>
 {
+    // Obtenemos el ID del usuario directamente de su sesión
     var userId = httpContext.User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
     if (userId is null) return Results.Unauthorized();
 
@@ -1408,7 +1423,7 @@ app.MapPost("/api/ventas", async (HttpContext httpContext, [FromBody] CreateVent
             Cantidad = i.Cantidad,
             PrecioUnitario = i.PrecioUnitario
         }).ToList(),
-        Total = dto.Items.Sum(i => i.Cantidad * i.PrecioUnitario), 
+        Total = dto.Items.Sum(i => i.Cantidad * i.PrecioUnitario), // Calcula el total automáticamente
         FechaVenta = DateTime.UtcNow
     };
 
@@ -1416,7 +1431,9 @@ app.MapPost("/api/ventas", async (HttpContext httpContext, [FromBody] CreateVent
     return Results.Created($"/api/ventas/{nuevaVenta.Id}", nuevaVenta);
 })
 .WithName("CreateVenta")
-.RequireAuthorization(); 
+.RequireAuthorization(); // <- Requiere estar logueado
+
+// 6. Obtener solo las compras/ventas del propio usuario
 app.MapGet("/api/ventas/mis-ventas", async (HttpContext httpContext, IMongoDatabase db) =>
 {
     var userId = httpContext.User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
@@ -1424,6 +1441,7 @@ app.MapGet("/api/ventas/mis-ventas", async (HttpContext httpContext, IMongoDatab
 
     var ventasCollection = db.GetCollection<VentaDocument>("ventas");
 
+    // Filtramos para que solo vea las de su propio ID
     var misVentas = await ventasCollection.Find(v => v.UserId == userId)
         .SortByDescending(v => v.FechaVenta)
         .ToListAsync();
@@ -1431,7 +1449,9 @@ app.MapGet("/api/ventas/mis-ventas", async (HttpContext httpContext, IMongoDatab
     return Results.Ok(misVentas);
 })
 .WithName("GetMisVentas")
-.RequireAuthorization(); 
+.RequireAuthorization(); // <- Requiere estar logueado
+
+// 7. Obtener TODAS las ventas realizadas en general (Para el panel de Admin)
 app.MapGet("/api/ventas", async (IMongoDatabase db) =>
 {
     var ventasCollection = db.GetCollection<VentaDocument>("ventas");
@@ -1449,6 +1469,8 @@ app.Run();
 // FUNCIONES AUXILIARES DE CÁLCULO DE PRECIO
 // ==========================================
 
+// Toma la lista de materiales solicitados (id + cantidad), consulta su costo
+// real en la colección de materiales y arma el detalle + el precio bruto total.
 static async Task<(List<ProductoMaterial> detalle, double precioBruto, string? error)> CalcularMateriales(
     List<ProductoMaterialDto> materialesDto,
     IMongoCollection<MaterialDocument> materialCollection)
@@ -1484,6 +1506,8 @@ static async Task<(List<ProductoMaterial> detalle, double precioBruto, string? e
     return (detalle, precioBruto, null);
 }
 
+// Vuelve a calcular PrecioBruto/PrecioFinal de un producto ya existente
+// tomando los costos ACTUALES de sus materiales (por si el proveedor subió precios).
 static async Task<object?> RecalcularPrecioProducto(
     string productoId,
     IMongoCollection<ProductoDocument> productoCollection,
@@ -1647,6 +1671,7 @@ public record SpotifyTokenDto(
 
 public record GoogleAuthDto(string IdToken);
 
+// --- Materiales ---
 public record CreateMaterialDto(
     string Nombre,
     string Descripcion,
@@ -1663,13 +1688,14 @@ public record UpdateMaterialDto(
     int? Stock = null
 );
 
+// --- Productos (basados en materiales) ---
 public record ProductoMaterialDto(string MaterialId, int Cantidad);
 
 public record CreateProductoDto(
     string Nombre,
     string Descripcion,
     List<ProductoMaterialDto> Materiales,
-    double? PorcentajeUtilidad,
+    double? PorcentajeUtilidad, // ej. 20 = 20%. Si no se manda, se usa 20% por default
     int? Stock
 );
 
@@ -1813,6 +1839,7 @@ public class RaspberryDocument
     public DateTime CreatedAt { get; set; }
 }
 
+// Catálogo de materiales/insumos (lo que se le compra al proveedor)
 public class MaterialDocument
 {
     [BsonId]
@@ -1820,12 +1847,15 @@ public class MaterialDocument
     public string? Id { get; set; }
     public string Nombre { get; set; } = null!;
     public string Descripcion { get; set; } = null!;
+    // Lo que cuesta comprarle este material al proveedor
     public double CostoUnitario { get; set; }
     public string Unidad { get; set; } = "pieza";
     public int Stock { get; set; }
     public DateTime CreatedAt { get; set; }
 }
 
+// Detalle de un material dentro de la "receta" de un producto,
+// con el costo unitario congelado al momento del cálculo.
 public class ProductoMaterial
 {
     public string MaterialId { get; set; } = null!;
@@ -1842,9 +1872,17 @@ public class ProductoDocument
     public string? Id { get; set; }
     public string Nombre { get; set; } = null!;
     public string Descripcion { get; set; } = null!;
+
+    // Materiales que componen el producto (la "receta")
     public List<ProductoMaterial> Materiales { get; set; } = new();
+
+    // % de utilidad que se le agrega al costo de los materiales (ej. 20 = 20%)
     public double PorcentajeUtilidad { get; set; } = 20;
+
+    // Precio bruto = suma de los costos de los materiales (lo que nos cuesta hacerlo)
     public double PrecioBruto { get; set; }
+
+    // Precio final = PrecioBruto + utilidad. Este es el precio de venta.
     public double PrecioFinal { get; set; }
 
     public int Stock { get; set; }

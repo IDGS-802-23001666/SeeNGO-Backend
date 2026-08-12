@@ -1,0 +1,422 @@
+[1mdiff --git a/Program.cs b/Program.cs[m
+[1mindex 48254d1..57473b4 100644[m
+[1m--- a/Program.cs[m
+[1m+++ b/Program.cs[m
+[36m@@ -1,8 +1,6 @@[m
+ using System.IdentityModel.Tokens.Jwt;[m
+ using System.Security.Claims;[m
+ using System.Text;[m
+[31m-using System.Text.Json;[m
+[31m-using System.Text.Json.Serialization;[m
+ using Microsoft.AspNetCore.Authentication.JwtBearer;[m
+ using Microsoft.AspNetCore.Mvc;[m
+ using Microsoft.IdentityModel.Tokens;[m
+[36m@@ -15,15 +13,13 @@[m [musing Microsoft.OpenApi;[m
+ [m
+ var builder = WebApplication.CreateBuilder(args);[m
+ [m
+[31m-builder.Configuration.AddJsonFile("appsettings.Local.json", optional: true, reloadOnChange: true);[m
+[31m-[m
+ builder.Services.AddCors(options =>[m
+ {[m
+     options.AddPolicy("SeenGoCorsPolicy", policy =>[m
+     {[m
+[31m-        policy.WithOrigins("http://localhost:4200", "https://seengo-frontweb-production.up.railway.app")[m
+[31m-              .AllowAnyMethod()                     [m
+[31m-              .AllowAnyHeader();                    [m
+[32m+[m[32m        policy.WithOrigins("http://localhost:4200", "https://seengo.up.railway.app")[m
+[32m+[m[32m              .AllowAnyMethod()[m
+[32m+[m[32m              .AllowAnyHeader();[m
+     });[m
+ });[m
+ [m
+[36m@@ -31,11 +27,7 @@[m [mvar conventionPack = new ConventionPack { new IgnoreIfNullConvention(true) };[m
+ ConventionRegistry.Register("SeenGoConventions", conventionPack, t => true);[m
+ [m
+ var mongoSettings = builder.Configuration.GetSection("MongoDbSettings");[m
+[31m-var mongoConnectionString = mongoSettings["ConnectionString"];[m
+[31m-if (string.IsNullOrWhiteSpace(mongoConnectionString))[m
+[31m-    throw new InvalidOperationException("Falta MongoDbSettings:ConnectionString. Configura la variable de entorno MongoDbSettings__ConnectionString o appsettings.Local.json.");[m
+[31m-[m
+[31m-builder.Services.AddSingleton<IMongoClient>(sp => new MongoClient(mongoConnectionString));[m
+[32m+[m[32mbuilder.Services.AddSingleton<IMongoClient>(sp => new MongoClient(mongoSettings["ConnectionString"]));[m
+ builder.Services.AddScoped(sp =>[m
+ {[m
+     var client = sp.GetRequiredService<IMongoClient>();[m
+[36m@@ -43,11 +35,7 @@[m [mbuilder.Services.AddScoped(sp =>[m
+ });[m
+ [m
+ var jwtSettings = builder.Configuration.GetSection("Jwt");[m
+[31m-var jwtSecret = jwtSettings["SecretKey"];[m
+[31m-if (string.IsNullOrWhiteSpace(jwtSecret))[m
+[31m-    throw new InvalidOperationException("Falta Jwt:SecretKey. Configura la variable de entorno Jwt__SecretKey o appsettings.Local.json.");[m
+[31m-[m
+[31m-var secretKey = Encoding.UTF8.GetBytes(jwtSecret);[m
+[32m+[m[32mvar secretKey = Encoding.UTF8.GetBytes(jwtSettings["SecretKey"]!);[m
+ [m
+ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)[m
+     .AddJwtBearer(options =>[m
+[36m@@ -64,17 +52,7 @@[m [mbuilder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)[m
+         };[m
+     });[m
+ [m
+[31m-builder.Services.AddAuthorization(options =>[m
+[31m-{[m
+[31m-    options.AddPolicy("AdminOnly", policy => policy.RequireRole("admin"));[m
+[31m-});[m
+[31m-[m
+[31m-// Sin esto, System.Text.Json serializa ObjectId como {Timestamp, CreationTime}[m
+[31m-// en vez de como el string hexadecimal que espera el front (Angular/Kotlin).[m
+[31m-builder.Services.ConfigureHttpJsonOptions(options =>[m
+[31m-{[m
+[31m-    options.SerializerOptions.Converters.Add(new ObjectIdJsonConverter());[m
+[31m-});[m
+[32m+[m[32mbuilder.Services.AddAuthorization();[m
+ builder.Services.AddEndpointsApiExplorer();[m
+ builder.Services.AddSwaggerGen(c =>[m
+ {[m
+[36m@@ -107,45 +85,10 @@[m [mbuilder.Services.AddSwaggerGen(c =>[m
+ var app = builder.Build();[m
+ [m
+ app.UseCors("SeenGoCorsPolicy");[m
+[31m-// En Development NO forzamos HTTPS: el emulador/celular no confia en el[m
+[31m-// certificado autofirmado de dotnet dev-certs, y eso rompe la app con[m
+[31m-// CertPathValidatorException al seguir la redirección 307/301.[m
+[31m-if (!app.Environment.IsDevelopment())[m
+[31m-{[m
+[31m-    app.UseHttpsRedirection();[m
+[31m-}[m
+[32m+[m[32mapp.UseHttpsRedirection();[m
+ app.UseAuthentication();[m
+ app.UseAuthorization();[m
+ [m
+[31m-// El catalogo de gestos es fijo: son las clases neutras que reconoce el[m
+[31m-// modelo Random Forest del pipeline (rf_signs.joblib), NO texto libre del[m
+[31m-// usuario. Solo cambia si el modelo se reentrena con una forma de mano[m
+[31m-// nueva (ver see-and-go-data-analysis/CLAUDE.md #2.1). Se siembra una vez[m
+[31m-// al arrancar; el upsert por Name lo hace seguro de repetir.[m
+[31m-using (var scope = app.Services.CreateScope())[m
+[31m-{[m
+[31m-    var db = scope.ServiceProvider.GetRequiredService<IMongoDatabase>();[m
+[31m-    var catalogCollection = db.GetCollection<GestureCatalogDocument>("gesture_catalog");[m
+[31m-[m
+[31m-    var catalogoFijo = new[][m
+[31m-    {[m
+[31m-        new GestureCatalogDocument { Name = "palma_abierta", Label = "Palma abierta" },[m
+[31m-        new GestureCatalogDocument { Name = "puno", Label = "Puño" },[m
+[31m-        new GestureCatalogDocument { Name = "paz", Label = "Paz (✌)" },[m
+[31m-        new GestureCatalogDocument { Name = "like", Label = "Pulgar arriba" },[m
+[31m-        new GestureCatalogDocument { Name = "loser", Label = "L (loser)" },[m
+[31m-        new GestureCatalogDocument { Name = "rock", Label = "Rock 🤘" },[m
+[31m-        new GestureCatalogDocument { Name = "dedo_anular", Label = "Dedo anular" },[m
+[31m-    };[m
+[31m-[m
+[31m-    foreach (var gesto in catalogoFijo)[m
+[31m-    {[m
+[31m-        var filtro = Builders<GestureCatalogDocument>.Filter.Eq(g => g.Name, gesto.Name);[m
+[31m-        var update = Builders<GestureCatalogDocument>.Update.Set(g => g.Label, gesto.Label);[m
+[31m-        await catalogCollection.UpdateOneAsync(filtro, update, new UpdateOptions { IsUpsert = true });[m
+[31m-    }[m
+[31m-}[m
+[31m-[m
+ if (app.Environment.IsDevelopment())[m
+ {[m
+     app.UseSwagger();[m
+[36m@@ -160,11 +103,8 @@[m [mif (app.Environment.IsDevelopment())[m
+ // TELEMETRY ENDPOINTS[m
+ // ==========================================[m
+ [m
+[31m-app.MapPost("/api/telemetry/event", async (HttpContext httpContext, [FromBody] DeviceEventDto eventDto, IMongoDatabase db, IConfiguration config) =>[m
+[32m+[m[32mapp.MapPost("/api/telemetry/event", async ([FromBody] DeviceEventDto eventDto, IMongoDatabase db) =>[m
+ {[m
+[31m-    if (!ServiceAuth.IsValid(httpContext, config))[m
+[31m-        return Results.Unauthorized();[m
+[31m-[m
+     var sessionCollection = db.GetCollection<UserSessionDocument>("user_sessions");[m
+ [m
+     var filter = Builders<UserSessionDocument>.Filter.And([m
+[36m@@ -215,18 +155,14 @@[m [mapp.MapGet("/api/telemetry/device/{deviceId}", async (string deviceId, [FromQuer[m
+ [m
+     return Results.Ok(logs);[m
+ })[m
+[31m-.WithName("GetDeviceTelemetry")[m
+[31m-.RequireAuthorization();[m
+[32m+[m[32m.WithName("GetDeviceTelemetry");[m
+ [m
+ // ==========================================[m
+ // PREDICTIVE SUGGESTIONS ENDPOINTS[m
+ // ==========================================[m
+ [m
+[31m-app.MapPost("/api/suggestions/inject-cluster-result", async (HttpContext httpContext, [FromBody] AnalyticsResultDto resultDto, IMongoDatabase db, IConfiguration config) =>[m
+[32m+[m[32mapp.MapPost("/api/suggestions/inject-cluster-result", async ([FromBody] AnalyticsResultDto resultDto, IMongoDatabase db) =>[m
+ {[m
+[31m-    if (!ServiceAuth.IsValid(httpContext, config))[m
+[31m-        return Results.Unauthorized();[m
+[31m-[m
+     var suggestionCollection = db.GetCollection<SuggestionDocument>("predictive_suggestions");[m
+ [m
+     var newSuggestion = new SuggestionDocument[m
+[36m@@ -256,8 +192,7 @@[m [mapp.MapGet("/api/suggestions/user/{userId}", async (string userId, IMongoDatabas[m
+     var list = await suggestionCollection.Find(filter).SortByDescending(s => s.CreatedAt).ToListAsync();[m
+     return Results.Ok(list);[m
+ })[m
+[31m-.WithName("GetActiveSuggestions")[m
+[31m-.RequireAuthorization();[m
+[32m+[m[32m.WithName("GetActiveSuggestions");[m
+ [m
+ app.MapPut("/api/suggestions/{id}/viewed", async (string id, IMongoDatabase db) =>[m
+ {[m
+[36m@@ -271,8 +206,7 @@[m [mapp.MapPut("/api/suggestions/{id}/viewed", async (string id, IMongoDatabase db)[m
+         ? Results.Ok(new { message = "Sugerencia marcada como vista." })[m
+         : Results.NotFound(new { message = "Sugerencia no encontrada." });[m
+ })[m
+[31m-.WithName("MarkSuggestionViewed")[m
+[31m-.RequireAuthorization();[m
+[32m+[m[32m.WithName("MarkSuggestionViewed");[m
+ [m
+ // ==========================================[m
+ // DEVICES ENDPOINTS[m
+[36m@@ -297,8 +231,7 @@[m [mapp.MapPost("/api/devices/sync-mdns", async ([FromBody] List<MdnsDeviceDto> devi[m
+     }[m
+     return Results.Ok(new { message = "Dispositivos Shelly sincronizados localmente." });[m
+ })[m
+[31m-.WithName("SyncMdnsDevices")[m
+[31m-.RequireAuthorization();[m
+[32m+[m[32m.WithName("SyncMdnsDevices");[m
+ [m
+ app.MapGet("/api/devices", async ([FromQuery] string? userId, IMongoDatabase db) =>[m
+ {[m
+[36m@@ -313,8 +246,7 @@[m [mapp.MapGet("/api/devices", async ([FromQuery] string? userId, IMongoDatabase db)[m
+     var devices = await deviceCollection.Find(filter).ToListAsync();[m
+     return Results.Ok(devices);[m
+ })[m
+[31m-.WithName("GetDevices")[m
+[31m-.RequireAuthorization();[m
+[32m+[m[32m.WithName("GetDevices");[m
+ [m
+ app.MapGet("/api/devices/{id}", async (string id, IMongoDatabase db) =>[m
+ {[m
+[36m@@ -328,8 +260,7 @@[m [mapp.MapGet("/api/devices/{id}", async (string id, IMongoDatabase db) =>[m
+         ? Results.Ok(device)[m
+         : Results.NotFound(new { message = "Dispositivo no encontrado." });[m
+ })[m
+[31m-.WithName("GetDeviceById")[m
+[31m-.RequireAuthorization();[m
+[32m+[m[32m.WithName("GetDeviceById");[m
+ [m
+ app.MapPost("/api/devices", async ([FromBody] CreateDeviceDto dto, IMongoDatabase db) =>[m
+ {[m
+[36m@@ -352,8 +283,7 @@[m [mapp.MapPost("/api/devices", async ([FromBody] CreateDeviceDto dto, IMongoDatabas[m
+     await deviceCollection.InsertOneAsync(device);[m
+     return Results.Created($"/api/devices/{device.Id}", device);[m
+ })[m
+[31m-.WithName("RegisterDevice")[m
+[31m-.RequireAuthorization();[m
+[32m+[m[32m.WithName("RegisterDevice");[m
+ [m
+ app.MapPut("/api/devices/{id}", async (string id, [FromBody] UpdateDeviceDto dto, IMongoDatabase db) =>[m
+ {[m
+[36m@@ -372,8 +302,7 @@[m [mapp.MapPut("/api/devices/{id}", async (string id, [FromBody] UpdateDeviceDto dto[m
+         ? Results.Ok(new { message = "Dispositivo actualizado." })[m
+         : Results.NotFound(new { message = "Dispositivo no encontrado." });[m
+ })[m
+[31m-.WithName("UpdateDevice")[m
+[31m-.RequireAuthorization();[m
+[32m+[m[32m.WithName("UpdateDevice");[m
+ [m
+ app.MapDelete("/api/devices/{id}", async (string id, IMongoDatabase db) =>[m
+ {[m
+[36m@@ -387,8 +316,7 @@[m [mapp.MapDelete("/api/devices/{id}", async (string id, IMongoDatabase db) =>[m
+         ? Results.Ok(new { message = "Dispositivo eliminado." })[m
+         : Results.NotFound(new { message = "Dispositivo no encontrado." });[m
+ })[m
+[31m-.WithName("DeleteDevice")[m
+[31m-.RequireAuthorization();[m
+[32m+[m[32m.WithName("DeleteDevice");[m
+ [m
+ app.MapPut("/api/devices/{id}/state", async (string id, [FromBody] DeviceStateDto dto, IMongoDatabase db) =>[m
+ {[m
+[36m@@ -403,8 +331,7 @@[m [mapp.MapPut("/api/devices/{id}/state", async (string id, [FromBody] DeviceStateDt[m
+         ? Results.Ok(new { message = $"Dispositivo {(dto.IsOn ? "encendido" : "apagado")}." })[m
+         : Results.NotFound(new { message = "Dispositivo no encontrado." });[m
+ })[m
+[31m-.WithName("ToggleDeviceState")[m
+[31m-.RequireAuthorization();[m
+[32m+[m[32m.WithName("ToggleDeviceState");[m
+ [m
+ app.MapPost("/api/devices/scan", async ([FromBody] ScanRequestDto dto, IMongoDatabase db) =>[m
+ {[m
+[36m@@ -421,8 +348,7 @@[m [mapp.MapPost("/api/devices/scan", async ([FromBody] ScanRequestDto dto, IMongoDat[m
+     await scanCollection.InsertOneAsync(scan);[m
+     return Results.Accepted($"/api/devices/scan/{scan.Id}", new { scanId = scan.Id.ToString(), message = "Escaneo iniciado." });[m
+ })[m
+[31m-.WithName("StartDeviceScan")[m
+[31m-.RequireAuthorization();[m
+[32m+[m[32m.WithName("StartDeviceScan");[m
+ [m
+ app.MapGet("/api/devices/scan/{scanId}", async (string scanId, IMongoDatabase db) =>[m
+ {[m
+[36m@@ -436,8 +362,7 @@[m [mapp.MapGet("/api/devices/scan/{scanId}", async (string scanId, IMongoDatabase db[m
+         ? Results.Ok(scan)[m
+         : Results.NotFound(new { message = "Escaneo no encontrado." });[m
+ })[m
+[31m-.WithName("GetScanResults")[m
+[31m-.RequireAuthorization();[m
+[32m+[m[32m.WithName("GetScanResults");[m
+ [m
+ // ==========================================[m
+ // AUTH ENDPOINTS[m
+[36m@@ -534,7 +459,7 @@[m [mapp.MapPost("/api/auth/google", async ([FromBody] GoogleAuthDto dto, IMongoDatab[m
+         {[m
+             user = new UserDocument[m
+             {[m
+[31m-                Name = payload.Name, [m
+[32m+[m[32m                Name = payload.Name,[m
+                 Email = payload.Email,[m
+                 PasswordHash = "[GOOGLE_AUTH]",[m
+                 Role = "client",[m
+[36m@@ -563,14 +488,11 @@[m [mapp.MapPost("/api/auth/google", async ([FromBody] GoogleAuthDto dto, IMongoDatab[m
+ // USER PROFILE ENDPOINTS[m
+ // ==========================================[m
+ [m
+[31m-app.MapGet("/api/users/{id}", async (string id, HttpContext httpContext, IMongoDatabase db) =>[m
+[32m+[m[32mapp.MapGet("/api/users/{id}", async (string id, IMongoDatabase db) =>[m
+ {[m
+[31m-    var requesterId = httpContext.User.FindFirst(ClaimTypes.NameIdentifier)?.Value;[m
+[31m-    if (requesterId != id && !httpContext.User.IsInRole("admin"))[m
+[31m-        return Results.Forbid();[m
+[31m-[m
+     var userCollection = db.GetCollection<UserDocument>("users");[m
+ [m
+[32m+[m[32m    // Ya no hacemos TryParse, comparamos directamente u.Id con id[m
+     var user = await userCollection.Find(u => u.Id == id).Project(u => new[m
+     {[m
+         u.Id,[m
+[36m@@ -585,15 +507,10 @@[m [mapp.MapGet("/api/users/{id}", async (string id, HttpContext httpContext, IMongoD[m
+         ? Results.Ok(user)[m
+         : Results.NotFound(new { message = "Usuario no encontrado." });[m
+ })[m
+[31m-.WithName("GetUserProfile")[m
+[31m-.RequireAuthorization();[m
+[32m+[m[32m.WithName("GetUserProfile");[m
+ [m
+[31m-app.MapPut("/api/users/{id}", async (string id, HttpContext httpContext, [FromBody] UpdateProfileDto dto, IMongoDatabase db) =>[m
+[32m+[m[32mapp.MapPut("/api/users/{id}", async (string id, [FromBody] UpdateProfileDto dto, IMongoDatabase db) =>[m
+ {[m
+[31m-    var requesterId = httpContext.User.FindFirst(ClaimTypes.NameIdentifier)?.Value;[m
+[31m-    if (requesterId != id && !httpContext.User.IsInRole("admin"))[m
+[31m-        return Results.Forbid();[m
+[31m-[m
+     var userCollection = db.GetCollection<UserDocument>("users");[m
+ [m
+     var updateBuilder = Builders<UserDocument>.Update.Set(u => u.Name, dto.Name);[m
+[36m@@ -602,14 +519,14 @@[m [mapp.MapPut("/api/users/{id}", async (string id, HttpContext httpContext, [FromBo[m
+     if (dto.Email is not null)[m
+         updateBuilder = updateBuilder.Set(u => u.Email, dto.Email);[m
+ [m
+[32m+[m[32m    // Igual aquí, actualizamos directo donde u.Id sea igual a id[m
+     var result = await userCollection.UpdateOneAsync(u => u.Id == id, updateBuilder);[m
+ [m
+     return result.ModifiedCount > 0[m
+         ? Results.Ok(new { message = "Perfil actualizado." })[m
+         : Results.NotFound(new { message = "Usuario no encontrado." });[m
+ })[m
+[31m-.WithName("UpdateUserProfile")[m
+[31m-.RequireAuthorization();[m
+[32m+[m[32m.WithName("UpdateUserProfile");[m
+ [m
+ // ==========================================[m
+ // ROUTINES ENDPOINTS[m
+[36m@@ -628,8 +545,7 @@[m [mapp.MapGet("/api/routines", async ([FromQuery] string? userId, IMongoDatabase db[m
+     var routines = await routineCollection.Find(filter).SortByDescending(r => r.CreatedAt).ToListAsync();[m
+     return Results.Ok(routines);[m
+ })[m
+[31m-.WithName("GetRoutines")[m
+[31m-.RequireAuthorization();[m
+[32m+[m[32m.WithName("GetRoutines");[m
+ [m
+ app.MapGet("/api/routines/{id}", async (string id, IMongoDatabase db) =>[m
+ {[m
+[36m@@ -643,8 +559,7 @@[m [mapp.MapGet("/api/routines/{id}", async (string id, IMongoDatabase db) =>[m
+         ? Results.Ok(routine)[m
+         : Results.NotFound(new { message = "Rutina no encontrada." });[m
+ })[m
+[31m-.WithName("GetRoutineById")[m
+[31m-.RequireAuthorization();[m
+[32m+[m[32m.WithName("GetRoutineById");[m
+ [m
+ app.MapPost("/api/routines", async ([FromBody] CreateRoutineDto dto, IMongoDatabase db) =>[m
+ {[m
+[36m@@ -670,8 +585,7 @@[m [mapp.MapPost("/api/routines", async ([FromBody] CreateRoutineDto dto, IMongoDatab[m
+     await routineCollection.InsertOneAsync(routine);[m
+     return Results.Created($"/api/routines/{routine.Id}", routine);[m
+ })[m
+[31m-.WithName("CreateRoutine")[m
+[31m-.RequireAuthorization();[m
+[32m+[m[32m.WithName("CreateRoutine");[m
+ [m
+ app.MapPut("/api/routines/{id}", async (string id, [FromBody] UpdateRoutineDto dto, IMongoDatabase db) =>[m
+ {[m
+[36m@@ -690,8 +604,7 @@[m [mapp.MapPut("/api/routines/{id}", async (string id, [FromBody] UpdateRoutineDto d[m
+         ? Results.Ok(new { message = "Rutina actualizada." })[m
+         : Results.NotFound(new { message = "Rutina no encontrada." });[m
+ })[m
+[31m-.WithName("UpdateRoutine")[m
+[31m-.RequireAuthorization();[m
+[32m+[m[32m.WithName("UpdateRoutine");[m
+ [m
+ app.MapDelete("/api/routines/{id}", async (string id, IMongoDatabase db) =>[m
+ {[m
+[36m@@ -705,8 +618,7 @@[m [mapp.MapDelete("/api/routines/{id}", async (string id, IMongoDatabase db) =>[m
+         ? Results.Ok(new { message = "Rutina eliminada." })[m
+         : Results.NotFound(new { message = "Rutina no encontrada." });[m
+ })[m
+[31m-.WithName("DeleteRoutine")[m
+[31m-.RequireAuthorization();[m
+[32m+[m[32m.WithName("DeleteRoutine");[m
+ [m
+ app.MapPost("/api/routines/{id}/execute", async (string id, IMongoDatabase db) =>[m
+ {[m
+[36m@@ -721,24 +633,12 @@[m [mapp.MapPost("/api/routines/{id}/execute", async (string id, IMongoDatabase db) =[m
+ [m
+     return Results.Ok(new { message = $"Rutina '{routine.Name}' ejecutada.", actions = routine.Actions });[m
+ })[m
+[31m-.WithName("ExecuteRoutine")[m
+[31m-.RequireAuthorization();[m
+[32m+[m[32m.WithName("ExecuteRoutine");[m
+ [m
+ // ==========================================[m
+ // GESTURE ENDPOINTS[m
+ // ==========================================[m
+ [m
+[31m-app.MapGet("/api/gestures/catalog", async (IMongoDatabase db) =>[m
+[31m-{[m
+[31m-    var catalogCollection = db.GetCollection<GestureCatalogDocument>("gesture_catalog");[m
+[31m-    var catalogo = await catalogCollection.Find(Builders<GestureCatalogDocument>.Filter.Empty)[m
+[31m-        .SortBy(g => g.Label)[m
+[31m-        .ToListAsync();[m
+[31m-    return Results.Ok(catalogo);[m
+[31m-})[m
+[31m-.WithName("GetGestureCatalog")[m
+[31m-.RequireAuthorization();[m
+[31m-[m
+ app.MapGet("/api/gestures", async ([FromQuery] string? userId, IMongoDatabase db) =>[m
+ {[m
+     var gestureCollection = db.GetCollection<GestureDocument>("gestures");[m
+[36m@@ -752,8 +652,7 @@[m [mapp.MapGet("/api/gestures", async ([FromQuery] string? userId, IMongoDatabase db[m
+     var gestures = await gestureCollection.Find(filter).ToListAsync();[m
+     return Results.Ok(gestures);[m
+ })[m
+[31m-.WithName("GetGestures")[m
+[31m-.RequireAuthorization();[m
+[32m+[m[32m.WithName("GetGestures");[m
+ [m
+ app.MapPost("/api/gestures", async ([FromBody] CreateGestureDto dto, IMongoDatabase db) =>[m
+ {[m
+[36m@@ -772,8 +671,7 @@[m [mapp.MapPost("/api/gestures", async ([FromBody] CreateGestureDto dto, IMongoDatab[m
+     await gestureCollection.InsertOneAsync(gesture);[m
+     return Results.Created($"/api/gestures/{gesture.Id}", gesture);[m
+ })[m
+[31m-.WithName("CreateGesture")[m
+[31m-.RequireAuthorization();[m
+[32m+[m[3

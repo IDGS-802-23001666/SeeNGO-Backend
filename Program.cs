@@ -1,6 +1,8 @@
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.IdentityModel.Tokens;
@@ -13,11 +15,13 @@ using Microsoft.OpenApi;
 
 var builder = WebApplication.CreateBuilder(args);
 
+builder.Configuration.AddJsonFile("appsettings.Local.json", optional: true, reloadOnChange: true);
+
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("SeenGoCorsPolicy", policy =>
     {
-        policy.WithOrigins("http://localhost:4200", "https://seengo.up.railway.app")
+        policy.WithOrigins("http://localhost:4200", "https://seengo-frontweb-production.up.railway.app")
               .AllowAnyMethod()
               .AllowAnyHeader();
     });
@@ -27,7 +31,11 @@ var conventionPack = new ConventionPack { new IgnoreIfNullConvention(true) };
 ConventionRegistry.Register("SeenGoConventions", conventionPack, t => true);
 
 var mongoSettings = builder.Configuration.GetSection("MongoDbSettings");
-builder.Services.AddSingleton<IMongoClient>(sp => new MongoClient(mongoSettings["ConnectionString"]));
+var mongoConnectionString = mongoSettings["ConnectionString"];
+if (string.IsNullOrWhiteSpace(mongoConnectionString))
+    throw new InvalidOperationException("Falta MongoDbSettings:ConnectionString. Configura la variable de entorno MongoDbSettings__ConnectionString o appsettings.Local.json.");
+
+builder.Services.AddSingleton<IMongoClient>(sp => new MongoClient(mongoConnectionString));
 builder.Services.AddScoped(sp =>
 {
     var client = sp.GetRequiredService<IMongoClient>();
@@ -35,7 +43,11 @@ builder.Services.AddScoped(sp =>
 });
 
 var jwtSettings = builder.Configuration.GetSection("Jwt");
-var secretKey = Encoding.UTF8.GetBytes(jwtSettings["SecretKey"]!);
+var jwtSecret = jwtSettings["SecretKey"];
+if (string.IsNullOrWhiteSpace(jwtSecret))
+    throw new InvalidOperationException("Falta Jwt:SecretKey. Configura la variable de entorno Jwt__SecretKey o appsettings.Local.json.");
+
+var secretKey = Encoding.UTF8.GetBytes(jwtSecret);
 
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddJwtBearer(options =>
@@ -52,7 +64,15 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
         };
     });
 
-builder.Services.AddAuthorization();
+builder.Services.AddAuthorization(options =>
+{
+    options.AddPolicy("AdminOnly", policy => policy.RequireRole("admin"));
+});
+
+builder.Services.ConfigureHttpJsonOptions(options =>
+{
+    options.SerializerOptions.Converters.Add(new ObjectIdJsonConverter());
+});
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c =>
 {
@@ -85,9 +105,36 @@ builder.Services.AddSwaggerGen(c =>
 var app = builder.Build();
 
 app.UseCors("SeenGoCorsPolicy");
-app.UseHttpsRedirection();
+if (!app.Environment.IsDevelopment())
+{
+    app.UseHttpsRedirection();
+}
 app.UseAuthentication();
 app.UseAuthorization();
+
+using (var scope = app.Services.CreateScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<IMongoDatabase>();
+    var catalogCollection = db.GetCollection<GestureCatalogDocument>("gesture_catalog");
+
+    var catalogoFijo = new[]
+    {
+        new GestureCatalogDocument { Name = "palma_abierta", Label = "Palma abierta" },
+        new GestureCatalogDocument { Name = "puno", Label = "Puño" },
+        new GestureCatalogDocument { Name = "paz", Label = "Paz (✌)" },
+        new GestureCatalogDocument { Name = "like", Label = "Pulgar arriba" },
+        new GestureCatalogDocument { Name = "loser", Label = "L (loser)" },
+        new GestureCatalogDocument { Name = "rock", Label = "Rock 🤘" },
+        new GestureCatalogDocument { Name = "dedo_anular", Label = "Dedo anular" },
+    };
+
+    foreach (var gesto in catalogoFijo)
+    {
+        var filtro = Builders<GestureCatalogDocument>.Filter.Eq(g => g.Name, gesto.Name);
+        var update = Builders<GestureCatalogDocument>.Update.Set(g => g.Label, gesto.Label);
+        await catalogCollection.UpdateOneAsync(filtro, update, new UpdateOptions { IsUpsert = true });
+    }
+}
 
 if (app.Environment.IsDevelopment())
 {
@@ -103,8 +150,11 @@ if (app.Environment.IsDevelopment())
 // TELEMETRY ENDPOINTS
 // ==========================================
 
-app.MapPost("/api/telemetry/event", async ([FromBody] DeviceEventDto eventDto, IMongoDatabase db) =>
+app.MapPost("/api/telemetry/event", async (HttpContext httpContext, [FromBody] DeviceEventDto eventDto, IMongoDatabase db, IConfiguration config) =>
 {
+    if (!ServiceAuth.IsValid(httpContext, config))
+        return Results.Unauthorized();
+
     var sessionCollection = db.GetCollection<UserSessionDocument>("user_sessions");
 
     var filter = Builders<UserSessionDocument>.Filter.And(
@@ -122,7 +172,7 @@ app.MapPost("/api/telemetry/event", async ([FromBody] DeviceEventDto eventDto, I
     });
 
     await sessionCollection.UpdateOneAsync(filter, update, new UpdateOptions { IsUpsert = true });
-    return Results.Ok(new { message = "Telemetr\u00eda registrada exitosamente en MongoDB." });
+    return Results.Ok(new { message = "Telemetría registrada exitosamente en MongoDB." });
 })
 .WithName("RegisterTelemetryEvent");
 
@@ -155,14 +205,18 @@ app.MapGet("/api/telemetry/device/{deviceId}", async (string deviceId, [FromQuer
 
     return Results.Ok(logs);
 })
-.WithName("GetDeviceTelemetry");
+.WithName("GetDeviceTelemetry")
+.RequireAuthorization();
 
 // ==========================================
 // PREDICTIVE SUGGESTIONS ENDPOINTS
 // ==========================================
 
-app.MapPost("/api/suggestions/inject-cluster-result", async ([FromBody] AnalyticsResultDto resultDto, IMongoDatabase db) =>
+app.MapPost("/api/suggestions/inject-cluster-result", async (HttpContext httpContext, [FromBody] AnalyticsResultDto resultDto, IMongoDatabase db, IConfiguration config) =>
 {
+    if (!ServiceAuth.IsValid(httpContext, config))
+        return Results.Unauthorized();
+
     var suggestionCollection = db.GetCollection<SuggestionDocument>("predictive_suggestions");
 
     var newSuggestion = new SuggestionDocument
@@ -192,7 +246,8 @@ app.MapGet("/api/suggestions/user/{userId}", async (string userId, IMongoDatabas
     var list = await suggestionCollection.Find(filter).SortByDescending(s => s.CreatedAt).ToListAsync();
     return Results.Ok(list);
 })
-.WithName("GetActiveSuggestions");
+.WithName("GetActiveSuggestions")
+.RequireAuthorization();
 
 app.MapPut("/api/suggestions/{id}/viewed", async (string id, IMongoDatabase db) =>
 {
@@ -206,7 +261,8 @@ app.MapPut("/api/suggestions/{id}/viewed", async (string id, IMongoDatabase db) 
         ? Results.Ok(new { message = "Sugerencia marcada como vista." })
         : Results.NotFound(new { message = "Sugerencia no encontrada." });
 })
-.WithName("MarkSuggestionViewed");
+.WithName("MarkSuggestionViewed")
+.RequireAuthorization();
 
 // ==========================================
 // DEVICES ENDPOINTS
@@ -231,7 +287,8 @@ app.MapPost("/api/devices/sync-mdns", async ([FromBody] List<MdnsDeviceDto> devi
     }
     return Results.Ok(new { message = "Dispositivos Shelly sincronizados localmente." });
 })
-.WithName("SyncMdnsDevices");
+.WithName("SyncMdnsDevices")
+.RequireAuthorization();
 
 app.MapGet("/api/devices", async ([FromQuery] string? userId, IMongoDatabase db) =>
 {
@@ -246,21 +303,23 @@ app.MapGet("/api/devices", async ([FromQuery] string? userId, IMongoDatabase db)
     var devices = await deviceCollection.Find(filter).ToListAsync();
     return Results.Ok(devices);
 })
-.WithName("GetDevices");
+.WithName("GetDevices")
+.RequireAuthorization();
 
 app.MapGet("/api/devices/{id}", async (string id, IMongoDatabase db) =>
 {
     var deviceCollection = db.GetCollection<DeviceDocument>("devices");
 
     if (!ObjectId.TryParse(id, out var objectId))
-        return Results.BadRequest(new { message = "ID inv\u00e1lido." });
+        return Results.BadRequest(new { message = "ID inválido." });
 
     var device = await deviceCollection.Find(d => d.Id == objectId).FirstOrDefaultAsync();
     return device is not null
         ? Results.Ok(device)
         : Results.NotFound(new { message = "Dispositivo no encontrado." });
 })
-.WithName("GetDeviceById");
+.WithName("GetDeviceById")
+.RequireAuthorization();
 
 app.MapPost("/api/devices", async ([FromBody] CreateDeviceDto dto, IMongoDatabase db) =>
 {
@@ -283,14 +342,15 @@ app.MapPost("/api/devices", async ([FromBody] CreateDeviceDto dto, IMongoDatabas
     await deviceCollection.InsertOneAsync(device);
     return Results.Created($"/api/devices/{device.Id}", device);
 })
-.WithName("RegisterDevice");
+.WithName("RegisterDevice")
+.RequireAuthorization();
 
 app.MapPut("/api/devices/{id}", async (string id, [FromBody] UpdateDeviceDto dto, IMongoDatabase db) =>
 {
     var deviceCollection = db.GetCollection<DeviceDocument>("devices");
 
     if (!ObjectId.TryParse(id, out var objectId))
-        return Results.BadRequest(new { message = "ID inv\u00e1lido." });
+        return Results.BadRequest(new { message = "ID inválido." });
 
     var update = Builders<DeviceDocument>.Update
         .Set(d => d.DisplayName, dto.DisplayName)
@@ -302,28 +362,30 @@ app.MapPut("/api/devices/{id}", async (string id, [FromBody] UpdateDeviceDto dto
         ? Results.Ok(new { message = "Dispositivo actualizado." })
         : Results.NotFound(new { message = "Dispositivo no encontrado." });
 })
-.WithName("UpdateDevice");
+.WithName("UpdateDevice")
+.RequireAuthorization();
 
 app.MapDelete("/api/devices/{id}", async (string id, IMongoDatabase db) =>
 {
     var deviceCollection = db.GetCollection<DeviceDocument>("devices");
 
     if (!ObjectId.TryParse(id, out var objectId))
-        return Results.BadRequest(new { message = "ID inv\u00e1lido." });
+        return Results.BadRequest(new { message = "ID inválido." });
 
     var result = await deviceCollection.DeleteOneAsync(d => d.Id == objectId);
     return result.DeletedCount > 0
         ? Results.Ok(new { message = "Dispositivo eliminado." })
         : Results.NotFound(new { message = "Dispositivo no encontrado." });
 })
-.WithName("DeleteDevice");
+.WithName("DeleteDevice")
+.RequireAuthorization();
 
 app.MapPut("/api/devices/{id}/state", async (string id, [FromBody] DeviceStateDto dto, IMongoDatabase db) =>
 {
     var deviceCollection = db.GetCollection<DeviceDocument>("devices");
 
     if (!ObjectId.TryParse(id, out var objectId))
-        return Results.BadRequest(new { message = "ID inv\u00e1lido." });
+        return Results.BadRequest(new { message = "ID inválido." });
 
     var update = Builders<DeviceDocument>.Update.Set(d => d.IsOn, dto.IsOn);
     var result = await deviceCollection.UpdateOneAsync(d => d.Id == objectId, update);
@@ -331,7 +393,8 @@ app.MapPut("/api/devices/{id}/state", async (string id, [FromBody] DeviceStateDt
         ? Results.Ok(new { message = $"Dispositivo {(dto.IsOn ? "encendido" : "apagado")}." })
         : Results.NotFound(new { message = "Dispositivo no encontrado." });
 })
-.WithName("ToggleDeviceState");
+.WithName("ToggleDeviceState")
+.RequireAuthorization();
 
 app.MapPost("/api/devices/scan", async ([FromBody] ScanRequestDto dto, IMongoDatabase db) =>
 {
@@ -348,21 +411,23 @@ app.MapPost("/api/devices/scan", async ([FromBody] ScanRequestDto dto, IMongoDat
     await scanCollection.InsertOneAsync(scan);
     return Results.Accepted($"/api/devices/scan/{scan.Id}", new { scanId = scan.Id.ToString(), message = "Escaneo iniciado." });
 })
-.WithName("StartDeviceScan");
+.WithName("StartDeviceScan")
+.RequireAuthorization();
 
 app.MapGet("/api/devices/scan/{scanId}", async (string scanId, IMongoDatabase db) =>
 {
     var scanCollection = db.GetCollection<ScanDocument>("device_scans");
 
     if (!ObjectId.TryParse(scanId, out var objectId))
-        return Results.BadRequest(new { message = "ID inv\u00e1lido." });
+        return Results.BadRequest(new { message = "ID inválido." });
 
     var scan = await scanCollection.Find(s => s.Id == objectId).FirstOrDefaultAsync();
     return scan is not null
         ? Results.Ok(scan)
         : Results.NotFound(new { message = "Escaneo no encontrado." });
 })
-.WithName("GetScanResults");
+.WithName("GetScanResults")
+.RequireAuthorization();
 
 // ==========================================
 // AUTH ENDPOINTS
@@ -374,7 +439,7 @@ app.MapPost("/api/auth/register", async ([FromBody] RegisterRequestDto dto, IMon
 
     var existing = await userCollection.Find(u => u.Email == dto.Email).FirstOrDefaultAsync();
     if (existing is not null)
-        return Results.Conflict(new { message = "El correo ya est\u00e1 registrado." });
+        return Results.Conflict(new { message = "El correo ya está registrado." });
 
     var user = new UserDocument
     {
@@ -413,13 +478,13 @@ app.MapPost("/api/auth/forgot-password", async ([FromBody] ForgotPasswordDto dto
 
     var user = await userCollection.Find(u => u.Email == dto.Email).FirstOrDefaultAsync();
     if (user is null)
-        return Results.Ok(new { message = "Si el correo existe, recibir\u00e1s instrucciones para restablecer tu contrase\u00f1a." });
+        return Results.Ok(new { message = "Si el correo existe, recibirás instrucciones para restablecer tu contraseña." });
 
     var resetCode = new Random().Next(100000, 999999).ToString();
     var update = Builders<UserDocument>.Update.Set(u => u.ResetCode, resetCode);
     await userCollection.UpdateOneAsync(u => u.Id == user.Id, update);
 
-    return Results.Ok(new { message = "Si el correo existe, recibir\u00e1s instrucciones para restablecer tu contrase\u00f1a." });
+    return Results.Ok(new { message = "Si el correo existe, recibirás instrucciones para restablecer tu contraseña." });
 })
 .WithName("ForgotPassword");
 
@@ -429,14 +494,14 @@ app.MapPost("/api/auth/reset-password", async ([FromBody] ResetPasswordDto dto, 
 
     var user = await userCollection.Find(u => u.ResetCode == dto.ResetCode).FirstOrDefaultAsync();
     if (user is null)
-        return Results.BadRequest(new { message = "C\u00f3digo de restablecimiento inv\u00e1lido." });
+        return Results.BadRequest(new { message = "Código de restablecimiento inválido." });
 
     var update = Builders<UserDocument>.Update
         .Set(u => u.PasswordHash, BCryptHelper.HashPassword(dto.NewPassword))
         .Unset(u => u.ResetCode);
 
     await userCollection.UpdateOneAsync(u => u.Id == user.Id, update);
-    return Results.Ok(new { message = "Contrase\u00f1a restablecida exitosamente." });
+    return Results.Ok(new { message = "Contraseña restablecida exitosamente." });
 })
 .WithName("ResetPassword");
 
@@ -488,11 +553,14 @@ app.MapPost("/api/auth/google", async ([FromBody] GoogleAuthDto dto, IMongoDatab
 // USER PROFILE ENDPOINTS
 // ==========================================
 
-app.MapGet("/api/users/{id}", async (string id, IMongoDatabase db) =>
+app.MapGet("/api/users/{id}", async (string id, HttpContext httpContext, IMongoDatabase db) =>
 {
+    var requesterId = httpContext.User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+    if (requesterId != id && !httpContext.User.IsInRole("admin"))
+        return Results.Forbid();
+
     var userCollection = db.GetCollection<UserDocument>("users");
 
-    // Ya no hacemos TryParse, comparamos directamente u.Id con id
     var user = await userCollection.Find(u => u.Id == id).Project(u => new
     {
         u.Id,
@@ -507,10 +575,15 @@ app.MapGet("/api/users/{id}", async (string id, IMongoDatabase db) =>
         ? Results.Ok(user)
         : Results.NotFound(new { message = "Usuario no encontrado." });
 })
-.WithName("GetUserProfile");
+.WithName("GetUserProfile")
+.RequireAuthorization();
 
-app.MapPut("/api/users/{id}", async (string id, [FromBody] UpdateProfileDto dto, IMongoDatabase db) =>
+app.MapPut("/api/users/{id}", async (string id, HttpContext httpContext, [FromBody] UpdateProfileDto dto, IMongoDatabase db) =>
 {
+    var requesterId = httpContext.User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+    if (requesterId != id && !httpContext.User.IsInRole("admin"))
+        return Results.Forbid();
+
     var userCollection = db.GetCollection<UserDocument>("users");
 
     var updateBuilder = Builders<UserDocument>.Update.Set(u => u.Name, dto.Name);
@@ -519,14 +592,14 @@ app.MapPut("/api/users/{id}", async (string id, [FromBody] UpdateProfileDto dto,
     if (dto.Email is not null)
         updateBuilder = updateBuilder.Set(u => u.Email, dto.Email);
 
-    // Igual aquí, actualizamos directo donde u.Id sea igual a id
     var result = await userCollection.UpdateOneAsync(u => u.Id == id, updateBuilder);
 
     return result.ModifiedCount > 0
         ? Results.Ok(new { message = "Perfil actualizado." })
         : Results.NotFound(new { message = "Usuario no encontrado." });
 })
-.WithName("UpdateUserProfile");
+.WithName("UpdateUserProfile")
+.RequireAuthorization();
 
 // ==========================================
 // ROUTINES ENDPOINTS
@@ -545,21 +618,23 @@ app.MapGet("/api/routines", async ([FromQuery] string? userId, IMongoDatabase db
     var routines = await routineCollection.Find(filter).SortByDescending(r => r.CreatedAt).ToListAsync();
     return Results.Ok(routines);
 })
-.WithName("GetRoutines");
+.WithName("GetRoutines")
+.RequireAuthorization();
 
 app.MapGet("/api/routines/{id}", async (string id, IMongoDatabase db) =>
 {
     var routineCollection = db.GetCollection<RoutineDocument>("routines");
 
     if (!ObjectId.TryParse(id, out var objectId))
-        return Results.BadRequest(new { message = "ID inv\u00e1lido." });
+        return Results.BadRequest(new { message = "ID inválido." });
 
     var routine = await routineCollection.Find(r => r.Id == objectId).FirstOrDefaultAsync();
     return routine is not null
         ? Results.Ok(routine)
         : Results.NotFound(new { message = "Rutina no encontrada." });
 })
-.WithName("GetRoutineById");
+.WithName("GetRoutineById")
+.RequireAuthorization();
 
 app.MapPost("/api/routines", async ([FromBody] CreateRoutineDto dto, IMongoDatabase db) =>
 {
@@ -585,14 +660,15 @@ app.MapPost("/api/routines", async ([FromBody] CreateRoutineDto dto, IMongoDatab
     await routineCollection.InsertOneAsync(routine);
     return Results.Created($"/api/routines/{routine.Id}", routine);
 })
-.WithName("CreateRoutine");
+.WithName("CreateRoutine")
+.RequireAuthorization();
 
 app.MapPut("/api/routines/{id}", async (string id, [FromBody] UpdateRoutineDto dto, IMongoDatabase db) =>
 {
     var routineCollection = db.GetCollection<RoutineDocument>("routines");
 
     if (!ObjectId.TryParse(id, out var objectId))
-        return Results.BadRequest(new { message = "ID inv\u00e1lido." });
+        return Results.BadRequest(new { message = "ID inválido." });
 
     var update = Builders<RoutineDocument>.Update
         .Set(r => r.Name, dto.Name)
@@ -604,28 +680,30 @@ app.MapPut("/api/routines/{id}", async (string id, [FromBody] UpdateRoutineDto d
         ? Results.Ok(new { message = "Rutina actualizada." })
         : Results.NotFound(new { message = "Rutina no encontrada." });
 })
-.WithName("UpdateRoutine");
+.WithName("UpdateRoutine")
+.RequireAuthorization();
 
 app.MapDelete("/api/routines/{id}", async (string id, IMongoDatabase db) =>
 {
     var routineCollection = db.GetCollection<RoutineDocument>("routines");
 
     if (!ObjectId.TryParse(id, out var objectId))
-        return Results.BadRequest(new { message = "ID inv\u00e1lido." });
+        return Results.BadRequest(new { message = "ID inválido." });
 
     var result = await routineCollection.DeleteOneAsync(r => r.Id == objectId);
     return result.DeletedCount > 0
         ? Results.Ok(new { message = "Rutina eliminada." })
         : Results.NotFound(new { message = "Rutina no encontrada." });
 })
-.WithName("DeleteRoutine");
+.WithName("DeleteRoutine")
+.RequireAuthorization();
 
 app.MapPost("/api/routines/{id}/execute", async (string id, IMongoDatabase db) =>
 {
     var routineCollection = db.GetCollection<RoutineDocument>("routines");
 
     if (!ObjectId.TryParse(id, out var objectId))
-        return Results.BadRequest(new { message = "ID inv\u00e1lido." });
+        return Results.BadRequest(new { message = "ID inválido." });
 
     var routine = await routineCollection.Find(r => r.Id == objectId).FirstOrDefaultAsync();
     if (routine is null)
@@ -633,11 +711,23 @@ app.MapPost("/api/routines/{id}/execute", async (string id, IMongoDatabase db) =
 
     return Results.Ok(new { message = $"Rutina '{routine.Name}' ejecutada.", actions = routine.Actions });
 })
-.WithName("ExecuteRoutine");
+.WithName("ExecuteRoutine")
+.RequireAuthorization();
 
 // ==========================================
 // GESTURE ENDPOINTS
 // ==========================================
+
+app.MapGet("/api/gestures/catalog", async (IMongoDatabase db) =>
+{
+    var catalogCollection = db.GetCollection<GestureCatalogDocument>("gesture_catalog");
+    var catalogo = await catalogCollection.Find(Builders<GestureCatalogDocument>.Filter.Empty)
+        .SortBy(g => g.Label)
+        .ToListAsync();
+    return Results.Ok(catalogo);
+})
+.WithName("GetGestureCatalog")
+.RequireAuthorization();
 
 app.MapGet("/api/gestures", async ([FromQuery] string? userId, IMongoDatabase db) =>
 {
@@ -652,7 +742,8 @@ app.MapGet("/api/gestures", async ([FromQuery] string? userId, IMongoDatabase db
     var gestures = await gestureCollection.Find(filter).ToListAsync();
     return Results.Ok(gestures);
 })
-.WithName("GetGestures");
+.WithName("GetGestures")
+.RequireAuthorization();
 
 app.MapPost("/api/gestures", async ([FromBody] CreateGestureDto dto, IMongoDatabase db) =>
 {
@@ -671,14 +762,15 @@ app.MapPost("/api/gestures", async ([FromBody] CreateGestureDto dto, IMongoDatab
     await gestureCollection.InsertOneAsync(gesture);
     return Results.Created($"/api/gestures/{gesture.Id}", gesture);
 })
-.WithName("CreateGesture");
+.WithName("CreateGesture")
+.RequireAuthorization();
 
 app.MapPut("/api/gestures/{id}", async (string id, [FromBody] UpdateGestureDto dto, IMongoDatabase db) =>
 {
     var gestureCollection = db.GetCollection<GestureDocument>("gestures");
 
     if (!ObjectId.TryParse(id, out var objectId))
-        return Results.BadRequest(new { message = "ID inv\u00e1lido." });
+        return Results.BadRequest(new { message = "ID inválido." });
 
     var update = Builders<GestureDocument>.Update
         .Set(g => g.Name, dto.Name)
@@ -690,28 +782,30 @@ app.MapPut("/api/gestures/{id}", async (string id, [FromBody] UpdateGestureDto d
         ? Results.Ok(new { message = "Gesto actualizado." })
         : Results.NotFound(new { message = "Gesto no encontrado." });
 })
-.WithName("UpdateGesture");
+.WithName("UpdateGesture")
+.RequireAuthorization();
 
 app.MapDelete("/api/gestures/{id}", async (string id, IMongoDatabase db) =>
 {
     var gestureCollection = db.GetCollection<GestureDocument>("gestures");
 
     if (!ObjectId.TryParse(id, out var objectId))
-        return Results.BadRequest(new { message = "ID inv\u00e1lido." });
+        return Results.BadRequest(new { message = "ID inválido." });
 
     var result = await gestureCollection.DeleteOneAsync(g => g.Id == objectId);
     return result.DeletedCount > 0
         ? Results.Ok(new { message = "Gesto eliminado." })
         : Results.NotFound(new { message = "Gesto no encontrado." });
 })
-.WithName("DeleteGesture");
+.WithName("DeleteGesture")
+.RequireAuthorization();
 
 app.MapPut("/api/gestures/{id}/link", async (string id, [FromBody] LinkGestureDto dto, IMongoDatabase db) =>
 {
     var gestureCollection = db.GetCollection<GestureDocument>("gestures");
 
     if (!ObjectId.TryParse(id, out var objectId))
-        return Results.BadRequest(new { message = "ID inv\u00e1lido." });
+        return Results.BadRequest(new { message = "ID inválido." });
 
     var update = Builders<GestureDocument>.Update
         .Set(g => g.LinkedDeviceId, dto.DeviceId)
@@ -722,7 +816,8 @@ app.MapPut("/api/gestures/{id}/link", async (string id, [FromBody] LinkGestureDt
         ? Results.Ok(new { message = "Gesto vinculado al dispositivo." })
         : Results.NotFound(new { message = "Gesto no encontrado." });
 })
-.WithName("LinkGesture");
+.WithName("LinkGesture")
+.RequireAuthorization();
 
 // ==========================================
 // ADMIN ENDPOINTS
@@ -752,7 +847,8 @@ app.MapGet("/api/admin/dashboard/metrics", async (IMongoDatabase db) =>
         generatedAt = DateTime.UtcNow
     });
 })
-.WithName("GetAdminDashboardMetrics");
+.WithName("GetAdminDashboardMetrics")
+.RequireAuthorization("AdminOnly");
 
 app.MapGet("/api/admin/users", async ([FromQuery] int? page, [FromQuery] int? limit, IMongoDatabase db) =>
 {
@@ -771,7 +867,8 @@ app.MapGet("/api/admin/users", async ([FromQuery] int? page, [FromQuery] int? li
 
     return Results.Ok(new { total, page = pageVal, limit = limitVal, data = users });
 })
-.WithName("AdminGetUsers");
+.WithName("AdminGetUsers")
+.RequireAuthorization("AdminOnly");
 
 app.MapGet("/api/admin/devices", async ([FromQuery] int? page, [FromQuery] int? limit, IMongoDatabase db) =>
 {
@@ -789,7 +886,8 @@ app.MapGet("/api/admin/devices", async ([FromQuery] int? page, [FromQuery] int? 
 
     return Results.Ok(new { total, page = pageVal, limit = limitVal, data = devices });
 })
-.WithName("AdminGetDevices");
+.WithName("AdminGetDevices")
+.RequireAuthorization("AdminOnly");
 
 app.MapGet("/api/admin/routines", async ([FromQuery] int? page, [FromQuery] int? limit, IMongoDatabase db) =>
 {
@@ -807,7 +905,8 @@ app.MapGet("/api/admin/routines", async ([FromQuery] int? page, [FromQuery] int?
 
     return Results.Ok(new { total, page = pageVal, limit = limitVal, data = routines });
 })
-.WithName("AdminGetRoutines");
+.WithName("AdminGetRoutines")
+.RequireAuthorization("AdminOnly");
 
 app.MapGet("/api/admin/raspberries", async (IMongoDatabase db) =>
 {
@@ -816,7 +915,8 @@ app.MapGet("/api/admin/raspberries", async (IMongoDatabase db) =>
     var raspberries = await raspberryCollection.Find(FilterDefinition<RaspberryDocument>.Empty).ToListAsync();
     return Results.Ok(raspberries);
 })
-.WithName("AdminGetRaspberries");
+.WithName("AdminGetRaspberries")
+.RequireAuthorization("AdminOnly");
 
 // ==========================================
 // ANALYTICS / CONSUMPTION ENDPOINTS
@@ -854,7 +954,8 @@ app.MapGet("/api/analytics/consumption/summary", async ([FromQuery] string userI
         sessionsCount = sessions.Count
     });
 })
-.WithName("GetConsumptionSummary");
+.WithName("GetConsumptionSummary")
+.RequireAuthorization();
 
 // ==========================================
 // CLIENT DASHBOARD ENDPOINTS
@@ -889,7 +990,8 @@ app.MapGet("/api/client/dashboard/{userId}", async (string userId, IMongoDatabas
         suggestions
     });
 })
-.WithName("GetClientDashboard");
+.WithName("GetClientDashboard")
+.RequireAuthorization();
 
 // ==========================================
 // INTEGRATIONS ENDPOINTS
@@ -912,7 +1014,8 @@ app.MapPost("/api/integrations/spotify/token", async ([FromBody] SpotifyTokenDto
     await integrationCollection.UpdateOneAsync(filter, update, new UpdateOptions { IsUpsert = true });
     return Results.Ok(new { message = "Token de Spotify almacenado." });
 })
-.WithName("StoreSpotifyToken");
+.WithName("StoreSpotifyToken")
+.RequireAuthorization();
 
 // ==========================================
 // HEALTH CHECK
@@ -955,7 +1058,8 @@ app.MapGet("/api/admin/summary", async (IMongoDatabase db) =>
         alertasPendientes
     });
 })
-.WithName("GetAdminSummary");
+.WithName("GetAdminSummary")
+.RequireAuthorization("AdminOnly");
 
 // ==========================================
 // ANALYTICS DEVICE-USAGE ENDPOINT
@@ -1032,7 +1136,8 @@ app.MapGet("/api/analytics/device-usage", async ([FromQuery] string? userId, [Fr
         period = period ?? "week"
     });
 })
-.WithName("GetDeviceUsage");
+.WithName("GetDeviceUsage")
+.RequireAuthorization();
 
 // ==========================================
 // RASPBERRY MONITOR ENDPOINT
@@ -1063,7 +1168,8 @@ app.MapGet("/api/monitor/raspberries", async (IMongoDatabase db) =>
 
     return Results.Ok(result);
 })
-.WithName("GetMonitorRaspberries");
+.WithName("GetMonitorRaspberries")
+.RequireAuthorization("AdminOnly");
 
 // ==========================================
 // USER PROFILE ENDPOINTS (JWT-based)
@@ -1078,7 +1184,7 @@ app.MapGet("/api/users/profile", async (HttpContext httpContext, IMongoDatabase 
     var userCollection = db.GetCollection<UserDocument>("users");
 
     if (!ObjectId.TryParse(userId, out var objectId))
-        return Results.BadRequest(new { message = "ID de usuario inv\u00e1lido." });
+        return Results.BadRequest(new { message = "ID de usuario inválido." });
 
     var user = await userCollection.Find(u => u.Id == userId)
         .Project(u => new
@@ -1108,7 +1214,7 @@ app.MapPut("/api/users/profile", async (HttpContext httpContext, [FromBody] Upda
     var userCollection = db.GetCollection<UserDocument>("users");
 
     if (!ObjectId.TryParse(userId, out var objectId))
-        return Results.BadRequest(new { message = "ID de usuario inv\u00e1lido." });
+        return Results.BadRequest(new { message = "ID de usuario inválido." });
 
     var updateBuilder = Builders<UserDocument>.Update.Set(u => u.Name, dto.Name);
     if (dto.Phone is not null)
@@ -1133,7 +1239,7 @@ app.MapDelete("/api/users/profile", async (HttpContext httpContext, IMongoDataba
     var userCollection = db.GetCollection<UserDocument>("users");
 
     if (!ObjectId.TryParse(userId, out var objectId))
-        return Results.BadRequest(new { message = "ID de usuario inv\u00e1lido." });
+        return Results.BadRequest(new { message = "ID de usuario inválido." });
 
     var result = await userCollection.DeleteOneAsync(u => u.Id == userId);
     return result.DeletedCount > 0
@@ -1181,135 +1287,28 @@ app.MapGet("/api/users/devices", async (HttpContext httpContext, IMongoDatabase 
 .WithName("GetMyDevices")
 .RequireAuthorization();
 
-// ==========================================
-// MATERIALES ENDPOINTS
-// Catálogo de insumos (Raspberry, ESP, cámaras, impresión 3D, etc.)
-// Cada material tiene el costo real de comprarlo al proveedor;
-// estos costos son la base para calcular el precio de los productos.
-// ==========================================
-
-// 1. Listar todos los materiales
-app.MapGet("/api/materiales", async (IMongoDatabase db) =>
-{
-    var materialCollection = db.GetCollection<MaterialDocument>("materiales");
-    var materiales = await materialCollection.Find(FilterDefinition<MaterialDocument>.Empty)
-        .SortBy(m => m.Nombre)
-        .ToListAsync();
-
-    return Results.Ok(materiales);
-})
-.WithName("GetMateriales");
-
-// 2. Obtener un material por id
-app.MapGet("/api/materiales/{id}", async (string id, IMongoDatabase db) =>
-{
-    var materialCollection = db.GetCollection<MaterialDocument>("materiales");
-
-    var material = await materialCollection.Find(m => m.Id == id).FirstOrDefaultAsync();
-    return material is not null
-        ? Results.Ok(material)
-        : Results.NotFound(new { message = "Material no encontrado." });
-})
-.WithName("GetMaterialById");
-
-// 3. Crear un material nuevo (ej: "Raspberry Pi 4", costo proveedor $850)
-app.MapPost("/api/materiales", async ([FromBody] CreateMaterialDto dto, IMongoDatabase db) =>
-{
-    var materialCollection = db.GetCollection<MaterialDocument>("materiales");
-
-    var material = new MaterialDocument
-    {
-        Nombre = dto.Nombre,
-        Descripcion = dto.Descripcion,
-        CostoUnitario = dto.CostoUnitario,
-        Unidad = dto.Unidad ?? "pieza",
-        Stock = dto.Stock ?? 0,
-        CreatedAt = DateTime.UtcNow
-    };
-
-    await materialCollection.InsertOneAsync(material);
-    return Results.Created($"/api/materiales/{material.Id}", material);
-})
-.WithName("CreateMaterial")
-.RequireAuthorization();
-
-// 4. Actualizar un material (ej: cambia el precio del proveedor)
-app.MapPut("/api/materiales/{id}", async (string id, [FromBody] UpdateMaterialDto dto, IMongoDatabase db) =>
-{
-    var materialCollection = db.GetCollection<MaterialDocument>("materiales");
-
-    var update = Builders<MaterialDocument>.Update
-        .Set(m => m.Nombre, dto.Nombre)
-        .Set(m => m.Descripcion, dto.Descripcion)
-        .Set(m => m.CostoUnitario, dto.CostoUnitario)
-        .Set(m => m.Unidad, dto.Unidad ?? "pieza")
-        .Set(m => m.Stock, dto.Stock ?? 0);
-
-    var result = await materialCollection.UpdateOneAsync(m => m.Id == id, update);
-
-    if (result.ModifiedCount == 0)
-        return Results.NotFound(new { message = "Material no encontrado." });
-
-    // Como el costo del material cambió, recalculamos el precio de todos
-    // los productos que lo usan para que no queden desfasados.
-    var productoCollection = db.GetCollection<ProductoDocument>("productos");
-    var productosAfectados = await productoCollection
-        .Find(p => p.Materiales.Any(mat => mat.MaterialId == id))
-        .ToListAsync();
-
-    foreach (var producto in productosAfectados)
-    {
-        await RecalcularPrecioProducto(producto.Id!, productoCollection, materialCollection);
-    }
-
-    return Results.Ok(new
-    {
-        message = "Material actualizado.",
-        productosRecalculados = productosAfectados.Count
-    });
-})
-.WithName("UpdateMaterial")
-.RequireAuthorization();
-
-// 5. Eliminar un material
-app.MapDelete("/api/materiales/{id}", async (string id, IMongoDatabase db) =>
-{
-    var materialCollection = db.GetCollection<MaterialDocument>("materiales");
-
-    var result = await materialCollection.DeleteOneAsync(m => m.Id == id);
-    return result.DeletedCount > 0
-        ? Results.Ok(new { message = "Material eliminado." })
-        : Results.NotFound(new { message = "Material no encontrado." });
-})
-.WithName("DeleteMaterial")
-.RequireAuthorization();
 
 // ==========================================
-// STORE / VENTAS ENDPOINTS
-// Los productos ahora se arman con una lista de materiales.
-// El precio ya NO se captura a mano: se calcula así:
-//   PrecioBruto = suma( costoUnitario del material * cantidad requerida )
-//   PrecioFinal = PrecioBruto * (1 + PorcentajeUtilidad / 100)
+// STORE / VENTAS / PRODUCTOS ENDPOINTS
 // ==========================================
 
-// 1. Obtener todos los productos del catálogo (con su desglose de precio)
-// OJO: aquí NO se regresa ImagenBase64 completa para que el listado no pese;
-// solo se manda "tieneImagen" para que el front sepa si debe pedir el detalle.
 app.MapGet("/api/productos", async (IMongoDatabase db) =>
 {
-    var collection = db.GetCollection<ProductoDocument>("productos");
-    var productos = await collection.Find(FilterDefinition<ProductoDocument>.Empty)
+    var productoCollection = db.GetCollection<ProductoDocument>("productos");
+    // Usamos Project para omitir ImagenBase64 en el listado y no saturar la red
+    var productos = await productoCollection.Find(FilterDefinition<ProductoDocument>.Empty)
         .SortByDescending(p => p.CreatedAt)
         .Project(p => new
         {
             p.Id,
             p.Nombre,
             p.Descripcion,
-            p.Materiales,
+            p.Receta,
             p.PorcentajeUtilidad,
             p.PrecioBruto,
             p.PrecioFinal,
             p.Stock,
+            p.Documentos,
             p.CreatedAt,
             TieneImagen = p.ImagenBase64 != null
         })
@@ -1318,42 +1317,48 @@ app.MapGet("/api/productos", async (IMongoDatabase db) =>
 })
 .WithName("GetProductos");
 
-// 1.1 Obtener un producto por id
 app.MapGet("/api/productos/{id}", async (string id, IMongoDatabase db) =>
 {
-    var collection = db.GetCollection<ProductoDocument>("productos");
-    var producto = await collection.Find(p => p.Id == id).FirstOrDefaultAsync();
+    if (!ObjectId.TryParse(id, out _))
+        return Results.BadRequest(new { message = "ID inválido." });
 
+    var productoCollection = db.GetCollection<ProductoDocument>("productos");
+
+    // Aquí sí devolvemos el objeto completo incluyendo la ImagenBase64
+    var producto = await productoCollection.Find(p => p.Id == id).FirstOrDefaultAsync();
     return producto is not null
         ? Results.Ok(producto)
         : Results.NotFound(new { message = "Producto no encontrado." });
 })
 .WithName("GetProductoById");
 
-// 2. Crear un producto a partir de su lista de materiales
-// Ejemplo: "Cigo" = 1 Raspberry + 1 Cámara + 1 ESP + 1 Impresión 3D, con 20% de utilidad
-app.MapPost("/api/productos", async ([FromBody] CreateProductoDto dto, IMongoDatabase db) =>
+app.MapPost("/api/productos", async ([FromBody] SaveProductoDto dto, IMongoDatabase db) =>
 {
-    var materialCollection = db.GetCollection<MaterialDocument>("materiales");
-    var productoCollection = db.GetCollection<ProductoDocument>("productos");
+    var validationError = ProductoValidator.Validate(dto);
+    if (validationError is not null)
+        return Results.BadRequest(new { message = validationError });
 
-    var (materialesDetalle, precioBruto, error) = await CalcularMateriales(dto.Materiales, materialCollection);
-    if (error is not null)
-        return Results.BadRequest(new { message = error });
+    var materiaPrimaCollection = db.GetCollection<MateriaPrimaDocument>("materias_primas");
+    var (receta, precioBruto, recetaError) = await RecetaBuilder.Construir(dto.Receta, materiaPrimaCollection);
+    if (recetaError is not null)
+        return Results.BadRequest(new { message = recetaError });
 
-    var porcentajeUtilidad = dto.PorcentajeUtilidad ?? 20; // 20% por default si no se especifica
+    var porcentajeUtilidad = dto.PorcentajeUtilidad ?? 20;
     var precioFinal = Math.Round(precioBruto * (1 + (porcentajeUtilidad / 100)), 2);
+
+    var productoCollection = db.GetCollection<ProductoDocument>("productos");
 
     var producto = new ProductoDocument
     {
-        Nombre = dto.Nombre,
-        Descripcion = dto.Descripcion,
-        Materiales = materialesDetalle,
+        Nombre = dto.Nombre.Trim(),
+        Descripcion = dto.Descripcion?.Trim() ?? string.Empty,
         PorcentajeUtilidad = porcentajeUtilidad,
         PrecioBruto = Math.Round(precioBruto, 2),
         PrecioFinal = precioFinal,
-        Stock = dto.Stock ?? 0,
+        Stock = dto.Stock,
         ImagenBase64 = dto.ImagenBase64,
+        Receta = receta,
+        Documentos = RecetaBuilder.ConstruirDocumentos(dto.Documentos),
         CreatedAt = DateTime.UtcNow
     };
 
@@ -1361,59 +1366,90 @@ app.MapPost("/api/productos", async ([FromBody] CreateProductoDto dto, IMongoDat
     return Results.Created($"/api/productos/{producto.Id}", producto);
 })
 .WithName("CreateProducto")
-.RequireAuthorization();
+.RequireAuthorization("AdminOnly");
 
-// 3. Actualizar un producto (materiales y/o % de utilidad); recalcula el precio
-app.MapPut("/api/productos/{id}", async (string id, [FromBody] UpdateProductoDto dto, IMongoDatabase db) =>
+app.MapPut("/api/productos/{id}", async (string id, [FromBody] SaveProductoDto dto, IMongoDatabase db) =>
 {
-    var materialCollection = db.GetCollection<MaterialDocument>("materiales");
-    var productoCollection = db.GetCollection<ProductoDocument>("productos");
+    if (!ObjectId.TryParse(id, out _))
+        return Results.BadRequest(new { message = "ID inválido." });
 
-    var (materialesDetalle, precioBruto, error) = await CalcularMateriales(dto.Materiales, materialCollection);
-    if (error is not null)
-        return Results.BadRequest(new { message = error });
+    var validationError = ProductoValidator.Validate(dto);
+    if (validationError is not null)
+        return Results.BadRequest(new { message = validationError });
+
+    var materiaPrimaCollection = db.GetCollection<MateriaPrimaDocument>("materias_primas");
+    var (receta, precioBruto, recetaError) = await RecetaBuilder.Construir(dto.Receta, materiaPrimaCollection);
+    if (recetaError is not null)
+        return Results.BadRequest(new { message = recetaError });
 
     var porcentajeUtilidad = dto.PorcentajeUtilidad ?? 20;
     var precioFinal = Math.Round(precioBruto * (1 + (porcentajeUtilidad / 100)), 2);
 
+    var productoCollection = db.GetCollection<ProductoDocument>("productos");
+
     var updateBuilder = Builders<ProductoDocument>.Update
-        .Set(p => p.Nombre, dto.Nombre)
-        .Set(p => p.Descripcion, dto.Descripcion)
-        .Set(p => p.Materiales, materialesDetalle)
+        .Set(p => p.Nombre, dto.Nombre.Trim())
+        .Set(p => p.Descripcion, dto.Descripcion?.Trim() ?? string.Empty)
         .Set(p => p.PorcentajeUtilidad, porcentajeUtilidad)
         .Set(p => p.PrecioBruto, Math.Round(precioBruto, 2))
         .Set(p => p.PrecioFinal, precioFinal)
-        .Set(p => p.Stock, dto.Stock ?? 0);
+        .Set(p => p.Stock, dto.Stock)
+        .Set(p => p.Receta, receta)
+        .Set(p => p.Documentos, RecetaBuilder.ConstruirDocumentos(dto.Documentos));
 
-    // Solo se actualiza la imagen si mandaron una nueva; si no, se conserva la que ya había.
     if (dto.ImagenBase64 is not null)
         updateBuilder = updateBuilder.Set(p => p.ImagenBase64, dto.ImagenBase64);
 
     var result = await productoCollection.UpdateOneAsync(p => p.Id == id, updateBuilder);
-    return result.ModifiedCount > 0
+    return result.MatchedCount > 0
         ? Results.Ok(new { message = "Producto actualizado.", precioBruto = Math.Round(precioBruto, 2), precioFinal })
         : Results.NotFound(new { message = "Producto no encontrado." });
 })
 .WithName("UpdateProducto")
-.RequireAuthorization();
+.RequireAuthorization("AdminOnly");
 
-// 3.1 Recalcular el precio de un producto (por si cambiaron costos de materiales)
+// NUEVO ENDPOINT: Recalcula precio usando Costos Promedios Actuales de las Materias Primas
 app.MapPost("/api/productos/{id}/recalcular", async (string id, IMongoDatabase db) =>
 {
-    var materialCollection = db.GetCollection<MaterialDocument>("materiales");
-    var productoCollection = db.GetCollection<ProductoDocument>("productos");
+    if (!ObjectId.TryParse(id, out _))
+        return Results.BadRequest(new { message = "ID inválido." });
 
-    var actualizado = await RecalcularPrecioProducto(id, productoCollection, materialCollection);
-    return actualizado is not null
-        ? Results.Ok(actualizado)
-        : Results.NotFound(new { message = "Producto no encontrado." });
+    var productoCollection = db.GetCollection<ProductoDocument>("productos");
+    var materiaPrimaCollection = db.GetCollection<MateriaPrimaDocument>("materias_primas");
+
+    var producto = await productoCollection.Find(p => p.Id == id).FirstOrDefaultAsync();
+    if (producto is null) return Results.NotFound(new { message = "Producto no encontrado." });
+
+    var recetaDto = producto.Receta.Select(r => new RecetaItemDto(r.MateriaPrimaId, r.Cantidad)).ToList();
+
+    var (nuevaReceta, precioBruto, error) = await RecetaBuilder.Construir(recetaDto, materiaPrimaCollection);
+    if (error is not null) return Results.BadRequest(new { message = error });
+
+    var precioFinal = Math.Round(precioBruto * (1 + (producto.PorcentajeUtilidad / 100)), 2);
+
+    var update = Builders<ProductoDocument>.Update
+        .Set(p => p.Receta, nuevaReceta)
+        .Set(p => p.PrecioBruto, Math.Round(precioBruto, 2))
+        .Set(p => p.PrecioFinal, precioFinal);
+
+    await productoCollection.UpdateOneAsync(p => p.Id == id, update);
+
+    return Results.Ok(new
+    {
+        productoId = id,
+        precioBruto = Math.Round(precioBruto, 2),
+        precioFinal,
+        porcentajeUtilidad = producto.PorcentajeUtilidad
+    });
 })
 .WithName("RecalcularPrecioProducto")
-.RequireAuthorization();
+.RequireAuthorization("AdminOnly");
 
-// 4. Eliminar un producto
 app.MapDelete("/api/productos/{id}", async (string id, IMongoDatabase db) =>
 {
+    if (!ObjectId.TryParse(id, out _))
+        return Results.BadRequest(new { message = "ID inválido." });
+
     var productoCollection = db.GetCollection<ProductoDocument>("productos");
 
     var result = await productoCollection.DeleteOneAsync(p => p.Id == id);
@@ -1422,38 +1458,84 @@ app.MapDelete("/api/productos/{id}", async (string id, IMongoDatabase db) =>
         : Results.NotFound(new { message = "Producto no encontrado." });
 })
 .WithName("DeleteProducto")
-.RequireAuthorization();
+.RequireAuthorization("AdminOnly");
 
-// 5. Agregar una nueva venta (Extrae el UserId del Token JWT)
-app.MapPost("/api/ventas", async (HttpContext httpContext, [FromBody] CreateVentaDto dto, IMongoDatabase db) =>
+app.MapPost("/api/ventas", async (HttpContext httpContext, [FromBody] CreateVentaDto dto, IMongoDatabase db, IMongoClient mongoClient) =>
 {
-    // Obtenemos el ID del usuario directamente de su sesión
     var userId = httpContext.User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
     if (userId is null) return Results.Unauthorized();
 
+    if (dto.Items is null || dto.Items.Count == 0)
+        return Results.BadRequest(new { message = "La venta debe incluir al menos un producto." });
+
+    if (dto.Items.Any(i => i.Cantidad <= 0))
+        return Results.BadRequest(new { message = "Cada cantidad debe ser mayor a cero." });
+
+    var productoCollection = db.GetCollection<ProductoDocument>("productos");
     var ventasCollection = db.GetCollection<VentaDocument>("ventas");
 
-    var nuevaVenta = new VentaDocument
-    {
-        UserId = userId,
-        Items = dto.Items.Select(i => new VentaItem
-        {
-            ProductoId = i.ProductoId,
-            NombreProducto = i.NombreProducto,
-            Cantidad = i.Cantidad,
-            PrecioUnitario = i.PrecioUnitario
-        }).ToList(),
-        Total = dto.Items.Sum(i => i.Cantidad * i.PrecioUnitario), // Calcula el total automáticamente
-        FechaVenta = DateTime.UtcNow
-    };
+    var cantidadesPorProducto = dto.Items
+        .GroupBy(i => i.ProductoId)
+        .ToDictionary(g => g.Key, g => g.Sum(i => i.Cantidad));
 
-    await ventasCollection.InsertOneAsync(nuevaVenta);
-    return Results.Created($"/api/ventas/{nuevaVenta.Id}", nuevaVenta);
+    if (cantidadesPorProducto.Keys.Any(id => !ObjectId.TryParse(id, out _)))
+        return Results.BadRequest(new { message = "La venta incluye un producto con ID inválido." });
+
+    using var session = await mongoClient.StartSessionAsync();
+
+    try
+    {
+        var venta = await session.WithTransactionAsync(async (s, ct) =>
+        {
+            var items = new List<VentaItem>();
+
+            foreach (var (productoId, cantidad) in cantidadesPorProducto)
+            {
+                var producto = await productoCollection.Find(s, p => p.Id == productoId).FirstOrDefaultAsync(ct);
+                if (producto is null)
+                    throw new VentaInvalidaException("Uno de los productos ya no está disponible.");
+
+                var stockFilter = Builders<ProductoDocument>.Filter.And(
+                    Builders<ProductoDocument>.Filter.Eq(p => p.Id, productoId),
+                    Builders<ProductoDocument>.Filter.Gte(p => p.Stock, cantidad));
+
+                var stockUpdate = Builders<ProductoDocument>.Update.Inc(p => p.Stock, -cantidad);
+
+                var stockResult = await productoCollection.UpdateOneAsync(s, stockFilter, stockUpdate, cancellationToken: ct);
+                if (stockResult.ModifiedCount == 0)
+                    throw new VentaInvalidaException($"Stock insuficiente para {producto.Nombre}.");
+
+                items.Add(new VentaItem
+                {
+                    ProductoId = productoId,
+                    NombreProducto = producto.Nombre,
+                    Cantidad = cantidad,
+                    PrecioUnitario = producto.PrecioFinal 
+                });
+            }
+
+            var nuevaVenta = new VentaDocument
+            {
+                UserId = userId,
+                Items = items,
+                Total = items.Sum(i => i.Cantidad * i.PrecioUnitario),
+                FechaVenta = DateTime.UtcNow
+            };
+
+            await ventasCollection.InsertOneAsync(s, nuevaVenta, cancellationToken: ct);
+            return nuevaVenta;
+        });
+
+        return Results.Created($"/api/ventas/{venta.Id}", venta);
+    }
+    catch (VentaInvalidaException ex)
+    {
+        return Results.BadRequest(new { message = ex.Message });
+    }
 })
 .WithName("CreateVenta")
-.RequireAuthorization(); // <- Requiere estar logueado
+.RequireAuthorization();
 
-// 6. Obtener solo las compras/ventas del propio usuario
 app.MapGet("/api/ventas/mis-ventas", async (HttpContext httpContext, IMongoDatabase db) =>
 {
     var userId = httpContext.User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
@@ -1461,7 +1543,6 @@ app.MapGet("/api/ventas/mis-ventas", async (HttpContext httpContext, IMongoDatab
 
     var ventasCollection = db.GetCollection<VentaDocument>("ventas");
 
-    // Filtramos para que solo vea las de su propio ID
     var misVentas = await ventasCollection.Find(v => v.UserId == userId)
         .SortByDescending(v => v.FechaVenta)
         .ToListAsync();
@@ -1469,9 +1550,8 @@ app.MapGet("/api/ventas/mis-ventas", async (HttpContext httpContext, IMongoDatab
     return Results.Ok(misVentas);
 })
 .WithName("GetMisVentas")
-.RequireAuthorization(); // <- Requiere estar logueado
+.RequireAuthorization();
 
-// 7. Obtener TODAS las ventas realizadas en general (Para el panel de Admin)
 app.MapGet("/api/ventas", async (IMongoDatabase db) =>
 {
     var ventasCollection = db.GetCollection<VentaDocument>("ventas");
@@ -1481,88 +1561,740 @@ app.MapGet("/api/ventas", async (IMongoDatabase db) =>
 
     return Results.Ok(todasLasVentas);
 })
-.WithName("GetAllVentas");
-
-app.Run();
+.WithName("GetAllVentas")
+.RequireAuthorization("AdminOnly");
 
 // ==========================================
-// FUNCIONES AUXILIARES DE CÁLCULO DE PRECIO
+// PRODUCCION ENDPOINTS
 // ==========================================
 
-// Toma la lista de materiales solicitados (id + cantidad), consulta su costo
-// real en la colección de materiales y arma el detalle + el precio bruto total.
-static async Task<(List<ProductoMaterial> detalle, double precioBruto, string? error)> CalcularMateriales(
-    List<ProductoMaterialDto> materialesDto,
-    IMongoCollection<MaterialDocument> materialCollection)
+app.MapGet("/api/produccion", async ([FromQuery] string? estado, IMongoDatabase db) =>
 {
-    var detalle = new List<ProductoMaterial>();
-    double precioBruto = 0;
+    var produccionCollection = db.GetCollection<ProduccionDocument>("producciones");
 
-    if (materialesDto is null || materialesDto.Count == 0)
-        return (detalle, 0, "El producto debe tener al menos un material.");
+    FilterDefinition<ProduccionDocument> filter;
+    if (!string.IsNullOrEmpty(estado))
+        filter = Builders<ProduccionDocument>.Filter.Eq(p => p.Estado, estado);
+    else
+        filter = Builders<ProduccionDocument>.Filter.Empty;
 
-    foreach (var item in materialesDto)
+    var lotes = await produccionCollection.Find(filter)
+        .SortByDescending(p => p.CreatedAt)
+        .ToListAsync();
+
+    return Results.Ok(lotes);
+})
+.WithName("GetProduccion")
+.RequireAuthorization("AdminOnly");
+
+app.MapGet("/api/produccion/{id}", async (string id, IMongoDatabase db) =>
+{
+    if (!ObjectId.TryParse(id, out _))
+        return Results.BadRequest(new { message = "ID inválido." });
+
+    var produccionCollection = db.GetCollection<ProduccionDocument>("producciones");
+
+    var lote = await produccionCollection.Find(p => p.Id == id).FirstOrDefaultAsync();
+    return lote is not null
+        ? Results.Ok(lote)
+        : Results.NotFound(new { message = "Lote de producción no encontrado." });
+})
+.WithName("GetProduccionById")
+.RequireAuthorization("AdminOnly");
+
+app.MapPost("/api/produccion", async ([FromBody] CreateProduccionDto dto, IMongoDatabase db) =>
+{
+    if (dto.CantidadPlaneada <= 0)
+        return Results.BadRequest(new { message = "La cantidad planeada debe ser mayor a cero." });
+
+    if (!ObjectId.TryParse(dto.ProductoId, out _))
+        return Results.BadRequest(new { message = "ID de producto inválido." });
+
+    var productoCollection = db.GetCollection<ProductoDocument>("productos");
+    var producto = await productoCollection.Find(p => p.Id == dto.ProductoId).FirstOrDefaultAsync();
+    if (producto is null)
+        return Results.BadRequest(new { message = "El producto no existe en el catálogo." });
+
+    var produccionCollection = db.GetCollection<ProduccionDocument>("producciones");
+
+    var lote = new ProduccionDocument
     {
-        if (item.Cantidad <= 0)
-            return (detalle, 0, $"La cantidad del material {item.MaterialId} debe ser mayor a 0.");
+        ProductoId = dto.ProductoId,
+        ProductoNombre = producto.Nombre,
+        CantidadPlaneada = dto.CantidadPlaneada,
+        CantidadProducida = 0,
+        Estado = ProduccionEstados.Planificado,
+        Notas = dto.Notas,
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow
+    };
 
-        var material = await materialCollection.Find(m => m.Id == item.MaterialId).FirstOrDefaultAsync();
-        if (material is null)
-            return (detalle, 0, $"El material con id {item.MaterialId} no existe.");
+    await produccionCollection.InsertOneAsync(lote);
+    return Results.Created($"/api/produccion/{lote.Id}", lote);
+})
+.WithName("CreateProduccion")
+.RequireAuthorization("AdminOnly");
 
-        var subtotal = material.CostoUnitario * item.Cantidad;
-        precioBruto += subtotal;
+app.MapPut("/api/produccion/{id}", async (string id, [FromBody] UpdateProduccionDto dto, IMongoDatabase db) =>
+{
+    if (!ObjectId.TryParse(id, out _))
+        return Results.BadRequest(new { message = "ID inválido." });
 
-        detalle.Add(new ProductoMaterial
+    if (!ProduccionEstados.EsValido(dto.Estado))
+        return Results.BadRequest(new { message = "Estado de producción inválido." });
+
+    if (dto.CantidadProducida < 0)
+        return Results.BadRequest(new { message = "La cantidad producida no puede ser negativa." });
+
+    if (dto.Estado == ProduccionEstados.Completado && dto.CantidadProducida == 0)
+        return Results.BadRequest(new { message = "No se puede completar un lote sin unidades producidas." });
+
+    var produccionCollection = db.GetCollection<ProduccionDocument>("producciones");
+
+    var lote = await produccionCollection.Find(p => p.Id == id).FirstOrDefaultAsync();
+    if (lote is null)
+        return Results.NotFound(new { message = "Lote de producción no encontrado." });
+
+    if (lote.Estado == ProduccionEstados.Completado || lote.Estado == ProduccionEstados.Cancelado)
+        return Results.BadRequest(new { message = "Un lote completado o cancelado ya no puede modificarse." });
+
+    var update = Builders<ProduccionDocument>.Update
+        .Set(p => p.Estado, dto.Estado)
+        .Set(p => p.CantidadProducida, dto.CantidadProducida)
+        .Set(p => p.Notas, dto.Notas)
+        .Set(p => p.UpdatedAt, DateTime.UtcNow);
+
+    if (dto.Estado == ProduccionEstados.Completado)
+        update = update.Set(p => p.CompletedAt, DateTime.UtcNow);
+
+    var guard = Builders<ProduccionDocument>.Filter.And(
+        Builders<ProduccionDocument>.Filter.Eq(p => p.Id, id),
+        Builders<ProduccionDocument>.Filter.Nin(p => p.Estado, new[] { ProduccionEstados.Completado, ProduccionEstados.Cancelado }));
+
+    var result = await produccionCollection.UpdateOneAsync(guard, update);
+    if (result.ModifiedCount == 0)
+        return Results.BadRequest(new { message = "El lote cambió de estado, recarga la lista." });
+
+    if (dto.Estado == ProduccionEstados.Completado)
+    {
+        var productoCollection = db.GetCollection<ProductoDocument>("productos");
+        var stockUpdate = Builders<ProductoDocument>.Update.Inc(p => p.Stock, dto.CantidadProducida);
+        await productoCollection.UpdateOneAsync(p => p.Id == lote.ProductoId, stockUpdate);
+    }
+
+    var actualizado = await produccionCollection.Find(p => p.Id == id).FirstOrDefaultAsync();
+    return Results.Ok(actualizado);
+})
+.WithName("UpdateProduccion")
+.RequireAuthorization("AdminOnly");
+
+app.MapDelete("/api/produccion/{id}", async (string id, IMongoDatabase db) =>
+{
+    if (!ObjectId.TryParse(id, out _))
+        return Results.BadRequest(new { message = "ID inválido." });
+
+    var produccionCollection = db.GetCollection<ProduccionDocument>("producciones");
+
+    var filter = Builders<ProduccionDocument>.Filter.And(
+        Builders<ProduccionDocument>.Filter.Eq(p => p.Id, id),
+        Builders<ProduccionDocument>.Filter.In(p => p.Estado, new[] { ProduccionEstados.Planificado, ProduccionEstados.Cancelado }));
+
+    var result = await produccionCollection.DeleteOneAsync(filter);
+    return result.DeletedCount > 0
+        ? Results.Ok(new { message = "Lote de producción eliminado." })
+        : Results.BadRequest(new { message = "Solo se pueden eliminar lotes planificados o cancelados." });
+})
+.WithName("DeleteProduccion")
+.RequireAuthorization("AdminOnly");
+
+// ==========================================
+// RESEÑAS ENDPOINTS
+// ==========================================
+
+app.MapGet("/api/resenas", async (IMongoDatabase db) =>
+{
+    var resenaCollection = db.GetCollection<ResenaDocument>("resenas");
+
+    var resenas = await resenaCollection.Find(FilterDefinition<ResenaDocument>.Empty)
+        .SortByDescending(r => r.CreatedAt)
+        .Limit(12)
+        .ToListAsync();
+
+    var publicas = resenas.Select(r => new
+    {
+        r.Id,
+        r.UserName,
+        r.ProductoNombre,
+        r.Calificacion,
+        r.Comentario,
+        r.CreatedAt
+    });
+
+    return Results.Ok(publicas);
+})
+.WithName("GetResenasPublicas");
+
+app.MapPost("/api/resenas", async (HttpContext httpContext, [FromBody] CrearResenaDto dto, IMongoDatabase db) =>
+{
+    var userId = httpContext.User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+    if (userId is null) return Results.Unauthorized();
+
+    if (dto.Calificacion < 1 || dto.Calificacion > 5)
+        return Results.BadRequest(new { message = "La calificación debe estar entre 1 y 5." });
+
+    if (string.IsNullOrWhiteSpace(dto.Comentario))
+        return Results.BadRequest(new { message = "Escribe un comentario sobre el producto." });
+
+    if (!ObjectId.TryParse(dto.ProductoId, out _))
+        return Results.BadRequest(new { message = "ID de producto inválido." });
+
+    var ventasCollection = db.GetCollection<VentaDocument>("ventas");
+    var comproProducto = await ventasCollection.CountDocumentsAsync(
+        Builders<VentaDocument>.Filter.And(
+            Builders<VentaDocument>.Filter.Eq(v => v.UserId, userId),
+            Builders<VentaDocument>.Filter.ElemMatch(v => v.Items, i => i.ProductoId == dto.ProductoId))) > 0;
+
+    if (!comproProducto)
+        return Results.BadRequest(new { message = "Solo puedes opinar sobre productos que hayas comprado." });
+
+    var productoCollection = db.GetCollection<ProductoDocument>("productos");
+    var producto = await productoCollection.Find(p => p.Id == dto.ProductoId).FirstOrDefaultAsync();
+    if (producto is null)
+        return Results.BadRequest(new { message = "El producto ya no existe." });
+
+    var userCollection = db.GetCollection<UserDocument>("users");
+    var user = await userCollection.Find(u => u.Id == userId).FirstOrDefaultAsync();
+    if (user is null) return Results.Unauthorized();
+
+    var resenaCollection = db.GetCollection<ResenaDocument>("resenas");
+
+    var filter = Builders<ResenaDocument>.Filter.And(
+        Builders<ResenaDocument>.Filter.Eq(r => r.UserId, userId),
+        Builders<ResenaDocument>.Filter.Eq(r => r.ProductoId, dto.ProductoId));
+
+    var update = Builders<ResenaDocument>.Update
+        .Set(r => r.Calificacion, dto.Calificacion)
+        .Set(r => r.Comentario, dto.Comentario.Trim())
+        .Set(r => r.Estado, "pendiente")
+        .Set(r => r.Respuesta, null)
+        .Set(r => r.CreatedAt, DateTime.UtcNow)
+        .SetOnInsert(r => r.UserId, userId)
+        .SetOnInsert(r => r.UserName, user.Name)
+        .SetOnInsert(r => r.ProductoId, dto.ProductoId)
+        .SetOnInsert(r => r.ProductoNombre, producto.Nombre);
+
+    await resenaCollection.UpdateOneAsync(filter, update, new UpdateOptions { IsUpsert = true });
+    return Results.Ok(new { message = "Gracias por tu opinión." });
+})
+.WithName("CrearResena")
+.RequireAuthorization();
+
+app.MapGet("/api/admin/resenas", async (IMongoDatabase db) =>
+{
+    var resenaCollection = db.GetCollection<ResenaDocument>("resenas");
+
+    var resenas = await resenaCollection.Find(FilterDefinition<ResenaDocument>.Empty)
+        .SortByDescending(r => r.CreatedAt)
+        .ToListAsync();
+
+    return Results.Ok(resenas);
+})
+.WithName("AdminGetResenas")
+.RequireAuthorization("AdminOnly");
+
+app.MapPut("/api/admin/resenas/{id}", async (string id, [FromBody] SeguimientoResenaDto dto, IMongoDatabase db) =>
+{
+    if (!ObjectId.TryParse(id, out _))
+        return Results.BadRequest(new { message = "ID inválido." });
+
+    if (dto.Estado != "pendiente" && dto.Estado != "atendido")
+        return Results.BadRequest(new { message = "Estado inválido." });
+
+    var resenaCollection = db.GetCollection<ResenaDocument>("resenas");
+
+    var update = Builders<ResenaDocument>.Update
+        .Set(r => r.Estado, dto.Estado)
+        .Set(r => r.Respuesta, string.IsNullOrWhiteSpace(dto.Respuesta) ? null : dto.Respuesta.Trim());
+
+    var result = await resenaCollection.UpdateOneAsync(r => r.Id == id, update);
+    return result.MatchedCount > 0
+        ? Results.Ok(new { message = "Seguimiento actualizado." })
+        : Results.NotFound(new { message = "Reseña no encontrada." });
+})
+.WithName("AdminSeguimientoResena")
+.RequireAuthorization("AdminOnly");
+
+// ==========================================
+// COTIZACIONES ENDPOINTS
+// ==========================================
+
+app.MapPost("/api/cotizaciones", async ([FromBody] CrearCotizacionDto dto, IMongoDatabase db) =>
+{
+    if (string.IsNullOrWhiteSpace(dto.Nombre) || string.IsNullOrWhiteSpace(dto.Email))
+        return Results.BadRequest(new { message = "Nombre y correo son obligatorios." });
+
+    if (dto.Items is null || dto.Items.Count == 0)
+        return Results.BadRequest(new { message = "Selecciona al menos un producto a cotizar." });
+
+    if (dto.Items.Any(i => i.Cantidad <= 0))
+        return Results.BadRequest(new { message = "Las cantidades deben ser mayores a cero." });
+
+    var productoCollection = db.GetCollection<ProductoDocument>("productos");
+    var items = new List<CotizacionItem>();
+
+    foreach (var item in dto.Items)
+    {
+        if (!ObjectId.TryParse(item.ProductoId, out _))
+            return Results.BadRequest(new { message = "La cotización incluye un producto inválido." });
+
+        var producto = await productoCollection.Find(p => p.Id == item.ProductoId).FirstOrDefaultAsync();
+        if (producto is null)
+            return Results.BadRequest(new { message = "La cotización incluye un producto que no existe." });
+
+        items.Add(new CotizacionItem
         {
-            MaterialId = material.Id!,
-            NombreMaterial = material.Nombre,
+            ProductoId = producto.Id!,
+            NombreProducto = producto.Nombre,
             Cantidad = item.Cantidad,
-            CostoUnitario = material.CostoUnitario,
-            Subtotal = Math.Round(subtotal, 2)
+            PrecioUnitario = producto.PrecioFinal, // <-- Usa PrecioFinal
+            Subtotal = Math.Round(producto.PrecioFinal * item.Cantidad, 2)
         });
     }
 
-    return (detalle, precioBruto, null);
-}
-
-// Vuelve a calcular PrecioBruto/PrecioFinal de un producto ya existente
-// tomando los costos ACTUALES de sus materiales (por si el proveedor subió precios).
-static async Task<object?> RecalcularPrecioProducto(
-    string productoId,
-    IMongoCollection<ProductoDocument> productoCollection,
-    IMongoCollection<MaterialDocument> materialCollection)
-{
-    var producto = await productoCollection.Find(p => p.Id == productoId).FirstOrDefaultAsync();
-    if (producto is null)
-        return null;
-
-    var materialesDto = producto.Materiales
-        .Select(m => new ProductoMaterialDto(m.MaterialId, m.Cantidad))
-        .ToList();
-
-    var (detalle, precioBruto, error) = await CalcularMateriales(materialesDto, materialCollection);
-    if (error is not null)
-        return null;
-
-    var precioFinal = Math.Round(precioBruto * (1 + (producto.PorcentajeUtilidad / 100)), 2);
-
-    var update = Builders<ProductoDocument>.Update
-        .Set(p => p.Materiales, detalle)
-        .Set(p => p.PrecioBruto, Math.Round(precioBruto, 2))
-        .Set(p => p.PrecioFinal, precioFinal);
-
-    await productoCollection.UpdateOneAsync(p => p.Id == productoId, update);
-
-    return new
+    var cotizacion = new CotizacionDocument
     {
-        productoId,
-        precioBruto = Math.Round(precioBruto, 2),
-        precioFinal,
-        porcentajeUtilidad = producto.PorcentajeUtilidad
+        Nombre = dto.Nombre.Trim(),
+        Email = dto.Email.Trim(),
+        Telefono = dto.Telefono?.Trim() ?? string.Empty,
+        TipoPropiedad = dto.TipoPropiedad?.Trim() ?? string.Empty,
+        Items = items,
+        Total = Math.Round(items.Sum(i => i.Subtotal), 2),
+        CreatedAt = DateTime.UtcNow
     };
-}
 
+    var cotizacionCollection = db.GetCollection<CotizacionDocument>("cotizaciones");
+    await cotizacionCollection.InsertOneAsync(cotizacion);
+
+    return Results.Ok(cotizacion);
+})
+.WithName("CrearCotizacion");
+
+app.MapGet("/api/admin/cotizaciones", async (IMongoDatabase db) =>
+{
+    var cotizacionCollection = db.GetCollection<CotizacionDocument>("cotizaciones");
+
+    var cotizaciones = await cotizacionCollection.Find(FilterDefinition<CotizacionDocument>.Empty)
+        .SortByDescending(c => c.CreatedAt)
+        .ToListAsync();
+
+    return Results.Ok(cotizaciones);
+})
+.WithName("AdminGetCotizaciones")
+.RequireAuthorization("AdminOnly");
+
+// ==========================================
+// CONTACTO ENDPOINTS
+// ==========================================
+
+app.MapPost("/api/contacto", async ([FromBody] CrearContactoDto dto, IMongoDatabase db) =>
+{
+    if (string.IsNullOrWhiteSpace(dto.Nombre) || string.IsNullOrWhiteSpace(dto.Email) || string.IsNullOrWhiteSpace(dto.Mensaje))
+        return Results.BadRequest(new { message = "Nombre, correo y mensaje son obligatorios." });
+
+    var mensaje = new MensajeContactoDocument
+    {
+        Nombre = dto.Nombre.Trim(),
+        Email = dto.Email.Trim(),
+        Mensaje = dto.Mensaje.Trim(),
+        Atendido = false,
+        CreatedAt = DateTime.UtcNow
+    };
+
+    var contactoCollection = db.GetCollection<MensajeContactoDocument>("mensajes_contacto");
+    await contactoCollection.InsertOneAsync(mensaje);
+
+    return Results.Ok(new { message = "Mensaje enviado. Te contactaremos pronto." });
+})
+.WithName("CrearMensajeContacto");
+
+app.MapGet("/api/admin/contacto", async (IMongoDatabase db) =>
+{
+    var contactoCollection = db.GetCollection<MensajeContactoDocument>("mensajes_contacto");
+
+    var mensajes = await contactoCollection.Find(FilterDefinition<MensajeContactoDocument>.Empty)
+        .SortByDescending(m => m.CreatedAt)
+        .ToListAsync();
+
+    return Results.Ok(mensajes);
+})
+.WithName("AdminGetMensajesContacto")
+.RequireAuthorization("AdminOnly");
+
+app.MapPut("/api/admin/contacto/{id}/atendido", async (string id, IMongoDatabase db) =>
+{
+    if (!ObjectId.TryParse(id, out _))
+        return Results.BadRequest(new { message = "ID inválido." });
+
+    var contactoCollection = db.GetCollection<MensajeContactoDocument>("mensajes_contacto");
+
+    var update = Builders<MensajeContactoDocument>.Update.Set(m => m.Atendido, true);
+    var result = await contactoCollection.UpdateOneAsync(m => m.Id == id, update);
+
+    return result.MatchedCount > 0
+        ? Results.Ok(new { message = "Mensaje marcado como atendido." })
+        : Results.NotFound(new { message = "Mensaje no encontrado." });
+})
+.WithName("AdminAtenderMensaje")
+.RequireAuthorization("AdminOnly");
+
+// ==========================================
+// PROVEEDORES ENDPOINTS
+// ==========================================
+
+app.MapGet("/api/admin/proveedores", async (IMongoDatabase db) =>
+{
+    var proveedorCollection = db.GetCollection<ProveedorDocument>("proveedores");
+
+    var proveedores = await proveedorCollection.Find(FilterDefinition<ProveedorDocument>.Empty)
+        .SortBy(p => p.Nombre)
+        .ToListAsync();
+
+    return Results.Ok(proveedores);
+})
+.WithName("AdminGetProveedores")
+.RequireAuthorization("AdminOnly");
+
+app.MapPost("/api/admin/proveedores", async ([FromBody] SaveProveedorDto dto, IMongoDatabase db) =>
+{
+    if (string.IsNullOrWhiteSpace(dto.Nombre))
+        return Results.BadRequest(new { message = "El nombre del proveedor es obligatorio." });
+
+    var proveedor = new ProveedorDocument
+    {
+        Nombre = dto.Nombre.Trim(),
+        Contacto = dto.Contacto?.Trim() ?? string.Empty,
+        Telefono = dto.Telefono?.Trim() ?? string.Empty,
+        Email = dto.Email?.Trim() ?? string.Empty,
+        Direccion = dto.Direccion?.Trim(),
+        CreatedAt = DateTime.UtcNow
+    };
+
+    var proveedorCollection = db.GetCollection<ProveedorDocument>("proveedores");
+    await proveedorCollection.InsertOneAsync(proveedor);
+
+    return Results.Created($"/api/admin/proveedores/{proveedor.Id}", proveedor);
+})
+.WithName("AdminCrearProveedor")
+.RequireAuthorization("AdminOnly");
+
+app.MapPut("/api/admin/proveedores/{id}", async (string id, [FromBody] SaveProveedorDto dto, IMongoDatabase db) =>
+{
+    if (!ObjectId.TryParse(id, out _))
+        return Results.BadRequest(new { message = "ID inválido." });
+
+    if (string.IsNullOrWhiteSpace(dto.Nombre))
+        return Results.BadRequest(new { message = "El nombre del proveedor es obligatorio." });
+
+    var proveedorCollection = db.GetCollection<ProveedorDocument>("proveedores");
+
+    var update = Builders<ProveedorDocument>.Update
+        .Set(p => p.Nombre, dto.Nombre.Trim())
+        .Set(p => p.Contacto, dto.Contacto?.Trim() ?? string.Empty)
+        .Set(p => p.Telefono, dto.Telefono?.Trim() ?? string.Empty)
+        .Set(p => p.Email, dto.Email?.Trim() ?? string.Empty)
+        .Set(p => p.Direccion, dto.Direccion?.Trim());
+
+    var result = await proveedorCollection.UpdateOneAsync(p => p.Id == id, update);
+    return result.MatchedCount > 0
+        ? Results.Ok(new { message = "Proveedor actualizado." })
+        : Results.NotFound(new { message = "Proveedor no encontrado." });
+})
+.WithName("AdminActualizarProveedor")
+.RequireAuthorization("AdminOnly");
+
+app.MapDelete("/api/admin/proveedores/{id}", async (string id, IMongoDatabase db) =>
+{
+    if (!ObjectId.TryParse(id, out _))
+        return Results.BadRequest(new { message = "ID inválido." });
+
+    var proveedorCollection = db.GetCollection<ProveedorDocument>("proveedores");
+
+    var result = await proveedorCollection.DeleteOneAsync(p => p.Id == id);
+    return result.DeletedCount > 0
+        ? Results.Ok(new { message = "Proveedor eliminado." })
+        : Results.NotFound(new { message = "Proveedor no encontrado." });
+})
+.WithName("AdminEliminarProveedor")
+.RequireAuthorization("AdminOnly");
+
+// ==========================================
+// MATERIA PRIMA ENDPOINTS
+// ==========================================
+
+app.MapGet("/api/admin/materias-primas", async (IMongoDatabase db) =>
+{
+    var materiaPrimaCollection = db.GetCollection<MateriaPrimaDocument>("materias_primas");
+
+    var materias = await materiaPrimaCollection.Find(FilterDefinition<MateriaPrimaDocument>.Empty)
+        .SortBy(m => m.Nombre)
+        .ToListAsync();
+
+    return Results.Ok(materias);
+})
+.WithName("AdminGetMateriasPrimas")
+.RequireAuthorization("AdminOnly");
+
+app.MapPost("/api/admin/materias-primas", async ([FromBody] SaveMateriaPrimaDto dto, IMongoDatabase db) =>
+{
+    if (string.IsNullOrWhiteSpace(dto.Nombre))
+        return Results.BadRequest(new { message = "El nombre de la materia prima es obligatorio." });
+
+    if (string.IsNullOrWhiteSpace(dto.Unidad))
+        return Results.BadRequest(new { message = "Indica la unidad de medida (pieza, metro, kg…)." });
+
+    var materiaPrima = new MateriaPrimaDocument
+    {
+        Nombre = dto.Nombre.Trim(),
+        Unidad = dto.Unidad.Trim(),
+        Existencia = 0,
+        CostoPromedio = 0,
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow
+    };
+
+    var materiaPrimaCollection = db.GetCollection<MateriaPrimaDocument>("materias_primas");
+    await materiaPrimaCollection.InsertOneAsync(materiaPrima);
+
+    return Results.Created($"/api/admin/materias-primas/{materiaPrima.Id}", materiaPrima);
+})
+.WithName("AdminCrearMateriaPrima")
+.RequireAuthorization("AdminOnly");
+
+app.MapPut("/api/admin/materias-primas/{id}", async (string id, [FromBody] SaveMateriaPrimaDto dto, IMongoDatabase db) =>
+{
+    if (!ObjectId.TryParse(id, out _))
+        return Results.BadRequest(new { message = "ID inválido." });
+
+    if (string.IsNullOrWhiteSpace(dto.Nombre) || string.IsNullOrWhiteSpace(dto.Unidad))
+        return Results.BadRequest(new { message = "Nombre y unidad son obligatorios." });
+
+    var materiaPrimaCollection = db.GetCollection<MateriaPrimaDocument>("materias_primas");
+
+    var update = Builders<MateriaPrimaDocument>.Update
+        .Set(m => m.Nombre, dto.Nombre.Trim())
+        .Set(m => m.Unidad, dto.Unidad.Trim())
+        .Set(m => m.UpdatedAt, DateTime.UtcNow);
+
+    var result = await materiaPrimaCollection.UpdateOneAsync(m => m.Id == id, update);
+    return result.MatchedCount > 0
+        ? Results.Ok(new { message = "Materia prima actualizada." })
+        : Results.NotFound(new { message = "Materia prima no encontrada." });
+})
+.WithName("AdminActualizarMateriaPrima")
+.RequireAuthorization("AdminOnly");
+
+app.MapDelete("/api/admin/materias-primas/{id}", async (string id, IMongoDatabase db) =>
+{
+    if (!ObjectId.TryParse(id, out _))
+        return Results.BadRequest(new { message = "ID inválido." });
+
+    var productoCollection = db.GetCollection<ProductoDocument>("productos");
+    var enUso = await productoCollection.CountDocumentsAsync(
+        Builders<ProductoDocument>.Filter.ElemMatch(p => p.Receta, r => r.MateriaPrimaId == id)) > 0;
+
+    if (enUso)
+        return Results.BadRequest(new { message = "No se puede eliminar: está en la receta de un producto." });
+
+    var materiaPrimaCollection = db.GetCollection<MateriaPrimaDocument>("materias_primas");
+
+    var result = await materiaPrimaCollection.DeleteOneAsync(m => m.Id == id);
+    return result.DeletedCount > 0
+        ? Results.Ok(new { message = "Materia prima eliminada." })
+        : Results.NotFound(new { message = "Materia prima no encontrada." });
+})
+.WithName("AdminEliminarMateriaPrima")
+.RequireAuthorization("AdminOnly");
+
+// ==========================================
+// COMPRAS A PROVEEDORES ENDPOINTS
+// ==========================================
+
+app.MapGet("/api/admin/compras", async (IMongoDatabase db) =>
+{
+    var compraCollection = db.GetCollection<CompraProveedorDocument>("compras_proveedores");
+
+    var compras = await compraCollection.Find(FilterDefinition<CompraProveedorDocument>.Empty)
+        .SortByDescending(c => c.CreatedAt)
+        .ToListAsync();
+
+    return Results.Ok(compras);
+})
+.WithName("AdminGetCompras")
+.RequireAuthorization("AdminOnly");
+
+app.MapPost("/api/admin/compras", async ([FromBody] CrearCompraDto dto, IMongoDatabase db) =>
+{
+    if (!ObjectId.TryParse(dto.ProveedorId, out _))
+        return Results.BadRequest(new { message = "Proveedor inválido." });
+
+    if (dto.Items is null || dto.Items.Count == 0)
+        return Results.BadRequest(new { message = "La compra debe incluir al menos una materia prima." });
+
+    if (dto.Items.Any(i => i.Cantidad <= 0 || i.CostoUnitario <= 0))
+        return Results.BadRequest(new { message = "Cantidades y costos deben ser mayores a cero." });
+
+    var proveedorCollection = db.GetCollection<ProveedorDocument>("proveedores");
+    var proveedor = await proveedorCollection.Find(p => p.Id == dto.ProveedorId).FirstOrDefaultAsync();
+    if (proveedor is null)
+        return Results.BadRequest(new { message = "El proveedor no existe." });
+
+    var materiaPrimaCollection = db.GetCollection<MateriaPrimaDocument>("materias_primas");
+    var items = new List<CompraItem>();
+
+    foreach (var item in dto.Items)
+    {
+        if (!ObjectId.TryParse(item.MateriaPrimaId, out _))
+            return Results.BadRequest(new { message = "La compra incluye una materia prima inválida." });
+
+        var materiaPrima = await materiaPrimaCollection.Find(m => m.Id == item.MateriaPrimaId).FirstOrDefaultAsync();
+        if (materiaPrima is null)
+            return Results.BadRequest(new { message = "La compra incluye una materia prima que no existe." });
+
+        items.Add(new CompraItem
+        {
+            MateriaPrimaId = materiaPrima.Id!,
+            Nombre = materiaPrima.Nombre,
+            Cantidad = item.Cantidad,
+            CostoUnitario = item.CostoUnitario
+        });
+    }
+
+    foreach (var item in items)
+    {
+        var materiaPrima = await materiaPrimaCollection.Find(m => m.Id == item.MateriaPrimaId).FirstOrDefaultAsync();
+        if (materiaPrima is null)
+            continue;
+
+        var existenciaNueva = materiaPrima.Existencia + item.Cantidad;
+        var costoNuevo = existenciaNueva <= 0
+            ? 0
+            : ((materiaPrima.Existencia * materiaPrima.CostoPromedio) + (item.Cantidad * item.CostoUnitario)) / existenciaNueva;
+
+        var update = Builders<MateriaPrimaDocument>.Update
+            .Set(m => m.Existencia, existenciaNueva)
+            .Set(m => m.CostoPromedio, Math.Round(costoNuevo, 2))
+            .Set(m => m.UpdatedAt, DateTime.UtcNow);
+
+        await materiaPrimaCollection.UpdateOneAsync(m => m.Id == item.MateriaPrimaId, update);
+    }
+
+    var compra = new CompraProveedorDocument
+    {
+        ProveedorId = proveedor.Id!,
+        ProveedorNombre = proveedor.Nombre,
+        Items = items,
+        Total = Math.Round(items.Sum(i => i.Cantidad * i.CostoUnitario), 2),
+        CreatedAt = DateTime.UtcNow
+    };
+
+    var compraCollection = db.GetCollection<CompraProveedorDocument>("compras_proveedores");
+    await compraCollection.InsertOneAsync(compra);
+
+    return Results.Created($"/api/admin/compras/{compra.Id}", compra);
+})
+.WithName("AdminCrearCompra")
+.RequireAuthorization("AdminOnly");
+
+// ==========================================
+// ADMIN USUARIOS ENDPOINTS
+// ==========================================
+
+app.MapPost("/api/admin/users", async ([FromBody] CrearUsuarioAdminDto dto, IMongoDatabase db) =>
+{
+    if (string.IsNullOrWhiteSpace(dto.Name) || string.IsNullOrWhiteSpace(dto.Email))
+        return Results.BadRequest(new { message = "Nombre y correo son obligatorios." });
+
+    if (dto.Role != "client" && dto.Role != "admin")
+        return Results.BadRequest(new { message = "El rol debe ser client o admin." });
+
+    var userCollection = db.GetCollection<UserDocument>("users");
+
+    var existente = await userCollection.Find(u => u.Email == dto.Email.Trim()).FirstOrDefaultAsync();
+    if (existente is not null)
+        return Results.Conflict(new { message = "El correo ya está registrado." });
+
+    var passwordTemporal = PasswordHelper.GenerarTemporal();
+
+    var user = new UserDocument
+    {
+        Name = dto.Name.Trim(),
+        Email = dto.Email.Trim(),
+        PasswordHash = BCryptHelper.HashPassword(passwordTemporal),
+        Role = dto.Role,
+        CreatedAt = DateTime.UtcNow
+    };
+
+    await userCollection.InsertOneAsync(user);
+
+    return Results.Created($"/api/users/{user.Id}", new
+    {
+        user.Id,
+        user.Name,
+        user.Email,
+        user.Role,
+        passwordTemporal
+    });
+})
+.WithName("AdminCrearUsuario")
+.RequireAuthorization("AdminOnly");
+
+app.MapDelete("/api/admin/users/{id}", async (string id, HttpContext httpContext, IMongoDatabase db) =>
+{
+    var requesterId = httpContext.User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+    if (requesterId == id)
+        return Results.BadRequest(new { message = "No puedes eliminar tu propia cuenta desde aquí." });
+
+    var userCollection = db.GetCollection<UserDocument>("users");
+
+    var result = await userCollection.DeleteOneAsync(u => u.Id == id);
+    return result.DeletedCount > 0
+        ? Results.Ok(new { message = "Usuario eliminado." })
+        : Results.NotFound(new { message = "Usuario no encontrado." });
+})
+.WithName("AdminEliminarUsuario")
+.RequireAuthorization("AdminOnly");
+
+// ==========================================
+// CAMBIO DE CONTRASEÑA ENDPOINT
+// ==========================================
+
+app.MapPut("/api/users/profile/password", async (HttpContext httpContext, [FromBody] CambioPasswordDto dto, IMongoDatabase db) =>
+{
+    var userId = httpContext.User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+    if (userId is null) return Results.Unauthorized();
+
+    if (string.IsNullOrWhiteSpace(dto.NewPassword) || dto.NewPassword.Length < 6)
+        return Results.BadRequest(new { message = "La nueva contraseña debe tener al menos 6 caracteres." });
+
+    var userCollection = db.GetCollection<UserDocument>("users");
+    var user = await userCollection.Find(u => u.Id == userId).FirstOrDefaultAsync();
+    if (user is null) return Results.Unauthorized();
+
+    if (user.PasswordHash == "[GOOGLE_AUTH]")
+        return Results.BadRequest(new { message = "Tu cuenta usa acceso con Google y no tiene contraseña propia." });
+
+    if (!BCryptHelper.VerifyPassword(dto.CurrentPassword, user.PasswordHash))
+        return Results.BadRequest(new { message = "La contraseña actual no es correcta." });
+
+    var update = Builders<UserDocument>.Update.Set(u => u.PasswordHash, BCryptHelper.HashPassword(dto.NewPassword));
+    await userCollection.UpdateOneAsync(u => u.Id == userId, update);
+
+    return Results.Ok(new { message = "Contraseña actualizada exitosamente." });
+})
+.WithName("CambiarPassword")
+.RequireAuthorization();
+
+app.Run();
 // ==========================================
 // DTOs (Data Transfer Objects)
 // ==========================================
@@ -1574,6 +2306,103 @@ public record CreateVentaItemDto(
     string NombreProducto,
     int Cantidad,
     double PrecioUnitario
+);
+
+public record SaveProductoDto(
+    string Nombre,
+    string? Descripcion,
+    double? PorcentajeUtilidad,
+    int Stock,
+    string? ImagenBase64,
+    List<RecetaItemDto>? Receta = null,
+    List<DocumentoProductoDto>? Documentos = null
+);
+
+public record CreateProduccionDto(
+    string ProductoId,
+    int CantidadPlaneada,
+    string? Notas
+);
+
+public record CrearResenaDto(
+    string ProductoId,
+    int Calificacion,
+    string Comentario
+);
+
+public record SeguimientoResenaDto(
+    string Estado,
+    string? Respuesta
+);
+
+public record CrearCotizacionDto(
+    string Nombre,
+    string Email,
+    string? Telefono,
+    string? TipoPropiedad,
+    List<CotizacionItemDto> Items
+);
+
+public record CotizacionItemDto(
+    string ProductoId,
+    int Cantidad
+);
+
+public record CrearContactoDto(
+    string Nombre,
+    string Email,
+    string Mensaje
+);
+
+public record SaveProveedorDto(
+    string Nombre,
+    string? Contacto,
+    string? Telefono,
+    string? Email,
+    string? Direccion
+);
+
+public record SaveMateriaPrimaDto(
+    string Nombre,
+    string Unidad
+);
+
+public record CrearCompraDto(
+    string ProveedorId,
+    List<CompraItemDto> Items
+);
+
+public record CompraItemDto(
+    string MateriaPrimaId,
+    double Cantidad,
+    double CostoUnitario
+);
+
+public record CrearUsuarioAdminDto(
+    string Name,
+    string Email,
+    string Role
+);
+
+public record CambioPasswordDto(
+    string CurrentPassword,
+    string NewPassword
+);
+
+public record RecetaItemDto(
+    string MateriaPrimaId,
+    double Cantidad
+);
+
+public record DocumentoProductoDto(
+    string Titulo,
+    string Url
+);
+
+public record UpdateProduccionDto(
+    string Estado,
+    int CantidadProducida,
+    string? Notas
 );
 
 public record DeviceEventDto(
@@ -1691,43 +2520,6 @@ public record SpotifyTokenDto(
 
 public record GoogleAuthDto(string IdToken);
 
-// --- Materiales ---
-public record CreateMaterialDto(
-    string Nombre,
-    string Descripcion,
-    double CostoUnitario,
-    string? Unidad = null,
-    int? Stock = null
-);
-
-public record UpdateMaterialDto(
-    string Nombre,
-    string Descripcion,
-    double CostoUnitario,
-    string? Unidad = null,
-    int? Stock = null
-);
-
-// --- Productos (basados en materiales) ---
-public record ProductoMaterialDto(string MaterialId, int Cantidad);
-
-public record CreateProductoDto(
-    string Nombre,
-    string Descripcion,
-    List<ProductoMaterialDto> Materiales,
-    double? PorcentajeUtilidad, // ej. 20 = 20%. Si no se manda, se usa 20% por default
-    int? Stock,
-    string? ImagenBase64 = null // ej. "data:image/png;base64,iVBORw0KGgo..."
-);
-
-public record UpdateProductoDto(
-    string Nombre,
-    string Descripcion,
-    List<ProductoMaterialDto> Materiales,
-    double? PorcentajeUtilidad,
-    int? Stock,
-    string? ImagenBase64 = null
-);
 
 // ==========================================
 // DOCUMENT MODELS (MongoDB Collections)
@@ -1818,6 +2610,24 @@ public class RoutineAction
     public string Value { get; set; } = null!;
 }
 
+public class ObjectIdJsonConverter : JsonConverter<ObjectId>
+{
+    public override ObjectId Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+        => ObjectId.Parse(reader.GetString()!);
+
+    public override void Write(Utf8JsonWriter writer, ObjectId value, JsonSerializerOptions options)
+        => writer.WriteStringValue(value.ToString());
+}
+
+public class GestureCatalogDocument
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public ObjectId Id { get; set; }
+    public string Name { get; set; } = null!;
+    public string Label { get; set; } = null!;
+}
+
 public class GestureDocument
 {
     [BsonId]
@@ -1861,32 +2671,6 @@ public class RaspberryDocument
     public DateTime CreatedAt { get; set; }
 }
 
-// Catálogo de materiales/insumos (lo que se le compra al proveedor)
-public class MaterialDocument
-{
-    [BsonId]
-    [BsonRepresentation(BsonType.ObjectId)]
-    public string? Id { get; set; }
-    public string Nombre { get; set; } = null!;
-    public string Descripcion { get; set; } = null!;
-    // Lo que cuesta comprarle este material al proveedor
-    public double CostoUnitario { get; set; }
-    public string Unidad { get; set; } = "pieza";
-    public int Stock { get; set; }
-    public DateTime CreatedAt { get; set; }
-}
-
-// Detalle de un material dentro de la "receta" de un producto,
-// con el costo unitario congelado al momento del cálculo.
-public class ProductoMaterial
-{
-    public string MaterialId { get; set; } = null!;
-    public string NombreMaterial { get; set; } = null!;
-    public int Cantidad { get; set; }
-    public double CostoUnitario { get; set; }
-    public double Subtotal { get; set; }
-}
-
 public class ProductoDocument
 {
     [BsonId]
@@ -1895,26 +2679,195 @@ public class ProductoDocument
     public string Nombre { get; set; } = null!;
     public string Descripcion { get; set; } = null!;
 
-    // Materiales que componen el producto (la "receta")
-    public List<ProductoMaterial> Materiales { get; set; } = new();
-
-    // % de utilidad que se le agrega al costo de los materiales (ej. 20 = 20%)
     public double PorcentajeUtilidad { get; set; } = 20;
-
-    // Precio bruto = suma de los costos de los materiales (lo que nos cuesta hacerlo)
     public double PrecioBruto { get; set; }
-
-    // Precio final = PrecioBruto + utilidad. Este es el precio de venta.
     public double PrecioFinal { get; set; }
 
     public int Stock { get; set; }
 
-    // Imagen del producto codificada en base64 (ej. "data:image/png;base64,....").
-    // Se guarda completa aquí, pero el listado /api/productos la excluye para
-    // que no pese; solo se regresa completa en /api/productos/{id}.
     public string? ImagenBase64 { get; set; }
 
+    public List<RecetaItem> Receta { get; set; } = new();
+    public List<DocumentoProducto> Documentos { get; set; } = new();
     public DateTime CreatedAt { get; set; }
+}
+
+public class RecetaItem
+{
+    public string MateriaPrimaId { get; set; } = null!;
+    public string Nombre { get; set; } = null!;
+    public string Unidad { get; set; } = null!;
+    public double Cantidad { get; set; }
+
+    public double CostoUnitario { get; set; }
+    public double Subtotal { get; set; }
+}
+
+public class DocumentoProducto
+{
+    public string Titulo { get; set; } = null!;
+    public string Url { get; set; } = null!;
+}
+
+public class ResenaDocument
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+    public string UserId { get; set; } = null!;
+    public string UserName { get; set; } = null!;
+    public string ProductoId { get; set; } = null!;
+    public string ProductoNombre { get; set; } = null!;
+    public int Calificacion { get; set; }
+    public string Comentario { get; set; } = null!;
+    public string Estado { get; set; } = "pendiente";
+    public string? Respuesta { get; set; }
+    public DateTime CreatedAt { get; set; }
+}
+
+public class CotizacionDocument
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+    public string Nombre { get; set; } = null!;
+    public string Email { get; set; } = null!;
+    public string Telefono { get; set; } = null!;
+    public string TipoPropiedad { get; set; } = null!;
+    public List<CotizacionItem> Items { get; set; } = new();
+    public double Total { get; set; }
+    public DateTime CreatedAt { get; set; }
+}
+
+public class CotizacionItem
+{
+    public string ProductoId { get; set; } = null!;
+    public string NombreProducto { get; set; } = null!;
+    public int Cantidad { get; set; }
+    public double PrecioUnitario { get; set; }
+    public double Subtotal { get; set; }
+}
+
+public class MensajeContactoDocument
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+    public string Nombre { get; set; } = null!;
+    public string Email { get; set; } = null!;
+    public string Mensaje { get; set; } = null!;
+    public bool Atendido { get; set; }
+    public DateTime CreatedAt { get; set; }
+}
+
+public class ProveedorDocument
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+    public string Nombre { get; set; } = null!;
+    public string Contacto { get; set; } = null!;
+    public string Telefono { get; set; } = null!;
+    public string Email { get; set; } = null!;
+    public string? Direccion { get; set; }
+    public DateTime CreatedAt { get; set; }
+}
+
+public class MateriaPrimaDocument
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+    public string Nombre { get; set; } = null!;
+    public string Unidad { get; set; } = null!;
+    public double Existencia { get; set; }
+    public double CostoPromedio { get; set; }
+    public DateTime CreatedAt { get; set; }
+    public DateTime UpdatedAt { get; set; }
+}
+
+public class CompraProveedorDocument
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+    public string ProveedorId { get; set; } = null!;
+    public string ProveedorNombre { get; set; } = null!;
+    public List<CompraItem> Items { get; set; } = new();
+    public double Total { get; set; }
+    public DateTime CreatedAt { get; set; }
+}
+
+public class CompraItem
+{
+    public string MateriaPrimaId { get; set; } = null!;
+    public string Nombre { get; set; } = null!;
+    public double Cantidad { get; set; }
+    public double CostoUnitario { get; set; }
+}
+
+public static class PasswordHelper
+{
+    private const string Caracteres = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
+
+    public static string GenerarTemporal(int longitud = 10)
+    {
+        var bytes = System.Security.Cryptography.RandomNumberGenerator.GetBytes(longitud);
+        var sb = new StringBuilder(longitud);
+        foreach (var b in bytes)
+            sb.Append(Caracteres[b % Caracteres.Length]);
+        return sb.ToString();
+    }
+}
+
+public static class RecetaBuilder
+{
+    public static async Task<(List<RecetaItem> Receta, double PrecioBruto, string? Error)> Construir(
+        List<RecetaItemDto>? items,
+        IMongoCollection<MateriaPrimaDocument> materiasPrimas)
+    {
+        var receta = new List<RecetaItem>();
+        double precioBruto = 0;
+
+        if (items is null || items.Count == 0)
+            return (receta, 0, null);
+
+        foreach (var item in items)
+        {
+            if (item.Cantidad <= 0)
+                return (receta, 0, "Las cantidades de la receta deben ser mayores a cero.");
+
+            if (!ObjectId.TryParse(item.MateriaPrimaId, out _))
+                return (receta, 0, "La receta incluye una materia prima con ID inválido.");
+
+            var materiaPrima = await materiasPrimas.Find(m => m.Id == item.MateriaPrimaId).FirstOrDefaultAsync();
+            if (materiaPrima is null)
+                return (receta, 0, "La receta incluye una materia prima que no existe.");
+
+            var subtotal = materiaPrima.CostoPromedio * item.Cantidad;
+            precioBruto += subtotal;
+
+            receta.Add(new RecetaItem
+            {
+                MateriaPrimaId = materiaPrima.Id!,
+                Nombre = materiaPrima.Nombre,
+                Unidad = materiaPrima.Unidad,
+                Cantidad = item.Cantidad,
+                CostoUnitario = materiaPrima.CostoPromedio,
+                Subtotal = Math.Round(subtotal, 2)
+            });
+        }
+
+        return (receta, Math.Round(precioBruto, 2), null);
+    }
+
+    public static List<DocumentoProducto> ConstruirDocumentos(List<DocumentoProductoDto>? documentos)
+    {
+        return (documentos ?? new List<DocumentoProductoDto>())
+            .Where(d => !string.IsNullOrWhiteSpace(d.Titulo) && !string.IsNullOrWhiteSpace(d.Url))
+            .Select(d => new DocumentoProducto { Titulo = d.Titulo.Trim(), Url = d.Url.Trim() })
+            .ToList();
+    }
 }
 
 public class VentaDocument
@@ -1935,6 +2888,67 @@ public class VentaItem
     public int Cantidad { get; set; }
     public double PrecioUnitario { get; set; }
     public double Subtotal => Cantidad * PrecioUnitario;
+}
+
+public class VentaInvalidaException(string message) : Exception(message)
+{
+}
+
+public class ProduccionDocument
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+    public string ProductoId { get; set; } = null!;
+    public string ProductoNombre { get; set; } = null!;
+    public int CantidadPlaneada { get; set; }
+    public int CantidadProducida { get; set; }
+    public string Estado { get; set; } = ProduccionEstados.Planificado;
+    public string? Notas { get; set; }
+    public DateTime CreatedAt { get; set; }
+    public DateTime UpdatedAt { get; set; }
+    public DateTime? CompletedAt { get; set; }
+}
+
+public static class ProduccionEstados
+{
+    public const string Planificado = "planificado";
+    public const string EnProduccion = "en_produccion";
+    public const string ControlCalidad = "control_calidad";
+    public const string Completado = "completado";
+    public const string Cancelado = "cancelado";
+
+    private static readonly string[] Todos =
+    {
+        Planificado, EnProduccion, ControlCalidad, Completado, Cancelado
+    };
+
+    public static bool EsValido(string estado) => Todos.Contains(estado);
+}
+
+public static class ProductoValidator
+{
+    public static string? Validate(SaveProductoDto dto)
+    {
+        if (string.IsNullOrWhiteSpace(dto.Nombre))
+            return "El nombre del producto es obligatorio.";
+        if (dto.Stock < 0)
+            return "El stock no puede ser negativo.";
+        return null;
+    }
+}
+
+public static class ServiceAuth
+{
+    public static bool IsValid(HttpContext context, IConfiguration configuration)
+    {
+        var expectedKey = configuration["ServiceApiKey"];
+        if (string.IsNullOrWhiteSpace(expectedKey))
+            return false;
+
+        return context.Request.Headers.TryGetValue("X-Api-Key", out var providedKey)
+            && providedKey == expectedKey;
+    }
 }
 
 public static class BCryptHelper

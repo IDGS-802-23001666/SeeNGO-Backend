@@ -1293,11 +1293,26 @@ app.MapDelete("/api/materiales/{id}", async (string id, IMongoDatabase db) =>
 // ==========================================
 
 // 1. Obtener todos los productos del catálogo (con su desglose de precio)
+// OJO: aquí NO se regresa ImagenBase64 completa para que el listado no pese;
+// solo se manda "tieneImagen" para que el front sepa si debe pedir el detalle.
 app.MapGet("/api/productos", async (IMongoDatabase db) =>
 {
     var collection = db.GetCollection<ProductoDocument>("productos");
     var productos = await collection.Find(FilterDefinition<ProductoDocument>.Empty)
         .SortByDescending(p => p.CreatedAt)
+        .Project(p => new
+        {
+            p.Id,
+            p.Nombre,
+            p.Descripcion,
+            p.Materiales,
+            p.PorcentajeUtilidad,
+            p.PrecioBruto,
+            p.PrecioFinal,
+            p.Stock,
+            p.CreatedAt,
+            TieneImagen = p.ImagenBase64 != null
+        })
         .ToListAsync();
     return Results.Ok(productos);
 })
@@ -1338,6 +1353,7 @@ app.MapPost("/api/productos", async ([FromBody] CreateProductoDto dto, IMongoDat
         PrecioBruto = Math.Round(precioBruto, 2),
         PrecioFinal = precioFinal,
         Stock = dto.Stock ?? 0,
+        ImagenBase64 = dto.ImagenBase64,
         CreatedAt = DateTime.UtcNow
     };
 
@@ -1360,7 +1376,7 @@ app.MapPut("/api/productos/{id}", async (string id, [FromBody] UpdateProductoDto
     var porcentajeUtilidad = dto.PorcentajeUtilidad ?? 20;
     var precioFinal = Math.Round(precioBruto * (1 + (porcentajeUtilidad / 100)), 2);
 
-    var update = Builders<ProductoDocument>.Update
+    var updateBuilder = Builders<ProductoDocument>.Update
         .Set(p => p.Nombre, dto.Nombre)
         .Set(p => p.Descripcion, dto.Descripcion)
         .Set(p => p.Materiales, materialesDetalle)
@@ -1369,7 +1385,11 @@ app.MapPut("/api/productos/{id}", async (string id, [FromBody] UpdateProductoDto
         .Set(p => p.PrecioFinal, precioFinal)
         .Set(p => p.Stock, dto.Stock ?? 0);
 
-    var result = await productoCollection.UpdateOneAsync(p => p.Id == id, update);
+    // Solo se actualiza la imagen si mandaron una nueva; si no, se conserva la que ya había.
+    if (dto.ImagenBase64 is not null)
+        updateBuilder = updateBuilder.Set(p => p.ImagenBase64, dto.ImagenBase64);
+
+    var result = await productoCollection.UpdateOneAsync(p => p.Id == id, updateBuilder);
     return result.ModifiedCount > 0
         ? Results.Ok(new { message = "Producto actualizado.", precioBruto = Math.Round(precioBruto, 2), precioFinal })
         : Results.NotFound(new { message = "Producto no encontrado." });
@@ -1696,7 +1716,8 @@ public record CreateProductoDto(
     string Descripcion,
     List<ProductoMaterialDto> Materiales,
     double? PorcentajeUtilidad, // ej. 20 = 20%. Si no se manda, se usa 20% por default
-    int? Stock
+    int? Stock,
+    string? ImagenBase64 = null // ej. "data:image/png;base64,iVBORw0KGgo..."
 );
 
 public record UpdateProductoDto(
@@ -1704,7 +1725,8 @@ public record UpdateProductoDto(
     string Descripcion,
     List<ProductoMaterialDto> Materiales,
     double? PorcentajeUtilidad,
-    int? Stock
+    int? Stock,
+    string? ImagenBase64 = null
 );
 
 // ==========================================
@@ -1886,6 +1908,12 @@ public class ProductoDocument
     public double PrecioFinal { get; set; }
 
     public int Stock { get; set; }
+
+    // Imagen del producto codificada en base64 (ej. "data:image/png;base64,....").
+    // Se guarda completa aquí, pero el listado /api/productos la excluye para
+    // que no pese; solo se regresa completa en /api/productos/{id}.
+    public string? ImagenBase64 { get; set; }
+
     public DateTime CreatedAt { get; set; }
 }
 

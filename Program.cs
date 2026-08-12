@@ -18,8 +18,8 @@ builder.Services.AddCors(options =>
     options.AddPolicy("SeenGoCorsPolicy", policy =>
     {
         policy.WithOrigins("http://localhost:4200", "https://seengo.up.railway.app")
-              .AllowAnyMethod()                     
-              .AllowAnyHeader();                    
+              .AllowAnyMethod()
+              .AllowAnyHeader();
     });
 });
 
@@ -459,7 +459,7 @@ app.MapPost("/api/auth/google", async ([FromBody] GoogleAuthDto dto, IMongoDatab
         {
             user = new UserDocument
             {
-                Name = payload.Name, 
+                Name = payload.Name,
                 Email = payload.Email,
                 PasswordHash = "[GOOGLE_AUTH]",
                 Role = "client",
@@ -1083,7 +1083,12 @@ app.MapGet("/api/users/profile", async (HttpContext httpContext, IMongoDatabase 
     var user = await userCollection.Find(u => u.Id == userId)
         .Project(u => new
         {
-            u.Id, u.Name, u.Email, u.Phone, u.Role, u.CreatedAt
+            u.Id,
+            u.Name,
+            u.Email,
+            u.Phone,
+            u.Role,
+            u.CreatedAt
         })
         .FirstOrDefaultAsync();
 
@@ -1159,33 +1164,235 @@ app.MapGet("/api/users/devices", async (HttpContext httpContext, IMongoDatabase 
         devicesOn = devices.Count(d => d.IsOn),
         data = devices.Select(d => new
         {
-            d.Id, d.UserId, d.MacAddress, d.LocalIp, d.DeviceType,
-            d.DisplayName, d.Room, d.Icon, d.IsOnline, d.IsOn, d.CreatedAt
+            d.Id,
+            d.UserId,
+            d.MacAddress,
+            d.LocalIp,
+            d.DeviceType,
+            d.DisplayName,
+            d.Room,
+            d.Icon,
+            d.IsOnline,
+            d.IsOn,
+            d.CreatedAt
         })
     });
 })
 .WithName("GetMyDevices")
 .RequireAuthorization();
 
+// ==========================================
+// MATERIALES ENDPOINTS
+// Catálogo de insumos (Raspberry, ESP, cámaras, impresión 3D, etc.)
+// Cada material tiene el costo real de comprarlo al proveedor;
+// estos costos son la base para calcular el precio de los productos.
+// ==========================================
 
+app.MapGet("/api/materiales", async (IMongoDatabase db) =>
+{
+    var materialCollection = db.GetCollection<MaterialDocument>("materiales");
+    var materiales = await materialCollection.Find(FilterDefinition<MaterialDocument>.Empty)
+        .SortBy(m => m.Nombre)
+        .ToListAsync();
+
+    return Results.Ok(materiales);
+})
+.WithName("GetMateriales");
+
+app.MapGet("/api/materiales/{id}", async (string id, IMongoDatabase db) =>
+{
+    var materialCollection = db.GetCollection<MaterialDocument>("materiales");
+
+    var material = await materialCollection.Find(m => m.Id == id).FirstOrDefaultAsync();
+    return material is not null
+        ? Results.Ok(material)
+        : Results.NotFound(new { message = "Material no encontrado." });
+})
+.WithName("GetMaterialById");
+
+app.MapPost("/api/materiales", async ([FromBody] CreateMaterialDto dto, IMongoDatabase db) =>
+{
+    var materialCollection = db.GetCollection<MaterialDocument>("materiales");
+
+    var material = new MaterialDocument
+    {
+        Nombre = dto.Nombre,
+        Descripcion = dto.Descripcion,
+        CostoUnitario = dto.CostoUnitario,
+        Unidad = dto.Unidad ?? "pieza",
+        Stock = dto.Stock ?? 0,
+        CreatedAt = DateTime.UtcNow
+    };
+
+    await materialCollection.InsertOneAsync(material);
+    return Results.Created($"/api/materiales/{material.Id}", material);
+})
+.WithName("CreateMaterial")
+.RequireAuthorization();
+
+app.MapPut("/api/materiales/{id}", async (string id, [FromBody] UpdateMaterialDto dto, IMongoDatabase db) =>
+{
+    var materialCollection = db.GetCollection<MaterialDocument>("materiales");
+
+    var update = Builders<MaterialDocument>.Update
+        .Set(m => m.Nombre, dto.Nombre)
+        .Set(m => m.Descripcion, dto.Descripcion)
+        .Set(m => m.CostoUnitario, dto.CostoUnitario)
+        .Set(m => m.Unidad, dto.Unidad ?? "pieza")
+        .Set(m => m.Stock, dto.Stock ?? 0);
+
+    var result = await materialCollection.UpdateOneAsync(m => m.Id == id, update);
+
+    if (result.ModifiedCount == 0)
+        return Results.NotFound(new { message = "Material no encontrado." });
+
+    var productoCollection = db.GetCollection<ProductoDocument>("productos");
+    var productosAfectados = await productoCollection
+        .Find(p => p.Materiales.Any(mat => mat.MaterialId == id))
+        .ToListAsync();
+
+    foreach (var producto in productosAfectados)
+    {
+        await RecalcularPrecioProducto(producto.Id!, productoCollection, materialCollection);
+    }
+
+    return Results.Ok(new
+    {
+        message = "Material actualizado.",
+        productosRecalculados = productosAfectados.Count
+    });
+})
+.WithName("UpdateMaterial")
+.RequireAuthorization();
+
+// 5. Eliminar un material
+app.MapDelete("/api/materiales/{id}", async (string id, IMongoDatabase db) =>
+{
+    var materialCollection = db.GetCollection<MaterialDocument>("materiales");
+
+    var result = await materialCollection.DeleteOneAsync(m => m.Id == id);
+    return result.DeletedCount > 0
+        ? Results.Ok(new { message = "Material eliminado." })
+        : Results.NotFound(new { message = "Material no encontrado." });
+})
+.WithName("DeleteMaterial")
+.RequireAuthorization();
 
 // ==========================================
 // STORE / VENTAS ENDPOINTS
+// Los productos ahora se arman con una lista de materiales.
+// El precio ya NO se captura a mano: se calcula así:
+//   PrecioBruto = suma( costoUnitario del material * cantidad requerida )
+//   PrecioFinal = PrecioBruto * (1 + PorcentajeUtilidad / 100)
 // ==========================================
 
-// 1. Obtener todos los productos del catálogo
 app.MapGet("/api/productos", async (IMongoDatabase db) =>
 {
     var collection = db.GetCollection<ProductoDocument>("productos");
-    var productos = await collection.Find(FilterDefinition<ProductoDocument>.Empty).ToListAsync();
+    var productos = await collection.Find(FilterDefinition<ProductoDocument>.Empty)
+        .SortByDescending(p => p.CreatedAt)
+        .ToListAsync();
     return Results.Ok(productos);
 })
 .WithName("GetProductos");
 
-// 2. Agregar una nueva venta (Extrae el UserId del Token JWT)
+app.MapGet("/api/productos/{id}", async (string id, IMongoDatabase db) =>
+{
+    var collection = db.GetCollection<ProductoDocument>("productos");
+    var producto = await collection.Find(p => p.Id == id).FirstOrDefaultAsync();
+
+    return producto is not null
+        ? Results.Ok(producto)
+        : Results.NotFound(new { message = "Producto no encontrado." });
+})
+.WithName("GetProductoById");
+
+app.MapPost("/api/productos", async ([FromBody] CreateProductoDto dto, IMongoDatabase db) =>
+{
+    var materialCollection = db.GetCollection<MaterialDocument>("materiales");
+    var productoCollection = db.GetCollection<ProductoDocument>("productos");
+
+    var (materialesDetalle, precioBruto, error) = await CalcularMateriales(dto.Materiales, materialCollection);
+    if (error is not null)
+        return Results.BadRequest(new { message = error });
+
+    var porcentajeUtilidad = dto.PorcentajeUtilidad ?? 20; 
+    var precioFinal = Math.Round(precioBruto * (1 + (porcentajeUtilidad / 100)), 2);
+
+    var producto = new ProductoDocument
+    {
+        Nombre = dto.Nombre,
+        Descripcion = dto.Descripcion,
+        Materiales = materialesDetalle,
+        PorcentajeUtilidad = porcentajeUtilidad,
+        PrecioBruto = Math.Round(precioBruto, 2),
+        PrecioFinal = precioFinal,
+        Stock = dto.Stock ?? 0,
+        CreatedAt = DateTime.UtcNow
+    };
+
+    await productoCollection.InsertOneAsync(producto);
+    return Results.Created($"/api/productos/{producto.Id}", producto);
+})
+.WithName("CreateProducto")
+.RequireAuthorization();
+
+app.MapPut("/api/productos/{id}", async (string id, [FromBody] UpdateProductoDto dto, IMongoDatabase db) =>
+{
+    var materialCollection = db.GetCollection<MaterialDocument>("materiales");
+    var productoCollection = db.GetCollection<ProductoDocument>("productos");
+
+    var (materialesDetalle, precioBruto, error) = await CalcularMateriales(dto.Materiales, materialCollection);
+    if (error is not null)
+        return Results.BadRequest(new { message = error });
+
+    var porcentajeUtilidad = dto.PorcentajeUtilidad ?? 20;
+    var precioFinal = Math.Round(precioBruto * (1 + (porcentajeUtilidad / 100)), 2);
+
+    var update = Builders<ProductoDocument>.Update
+        .Set(p => p.Nombre, dto.Nombre)
+        .Set(p => p.Descripcion, dto.Descripcion)
+        .Set(p => p.Materiales, materialesDetalle)
+        .Set(p => p.PorcentajeUtilidad, porcentajeUtilidad)
+        .Set(p => p.PrecioBruto, Math.Round(precioBruto, 2))
+        .Set(p => p.PrecioFinal, precioFinal)
+        .Set(p => p.Stock, dto.Stock ?? 0);
+
+    var result = await productoCollection.UpdateOneAsync(p => p.Id == id, update);
+    return result.ModifiedCount > 0
+        ? Results.Ok(new { message = "Producto actualizado.", precioBruto = Math.Round(precioBruto, 2), precioFinal })
+        : Results.NotFound(new { message = "Producto no encontrado." });
+})
+.WithName("UpdateProducto")
+.RequireAuthorization();
+
+app.MapPost("/api/productos/{id}/recalcular", async (string id, IMongoDatabase db) =>
+{
+    var materialCollection = db.GetCollection<MaterialDocument>("materiales");
+    var productoCollection = db.GetCollection<ProductoDocument>("productos");
+
+    var actualizado = await RecalcularPrecioProducto(id, productoCollection, materialCollection);
+    return actualizado is not null
+        ? Results.Ok(actualizado)
+        : Results.NotFound(new { message = "Producto no encontrado." });
+})
+.WithName("RecalcularPrecioProducto")
+.RequireAuthorization();
+
+app.MapDelete("/api/productos/{id}", async (string id, IMongoDatabase db) =>
+{
+    var productoCollection = db.GetCollection<ProductoDocument>("productos");
+
+    var result = await productoCollection.DeleteOneAsync(p => p.Id == id);
+    return result.DeletedCount > 0
+        ? Results.Ok(new { message = "Producto eliminado." })
+        : Results.NotFound(new { message = "Producto no encontrado." });
+})
+.WithName("DeleteProducto")
+.RequireAuthorization();
+
 app.MapPost("/api/ventas", async (HttpContext httpContext, [FromBody] CreateVentaDto dto, IMongoDatabase db) =>
 {
-    // Obtenemos el ID del usuario directamente de su sesión
     var userId = httpContext.User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
     if (userId is null) return Results.Unauthorized();
 
@@ -1201,7 +1408,7 @@ app.MapPost("/api/ventas", async (HttpContext httpContext, [FromBody] CreateVent
             Cantidad = i.Cantidad,
             PrecioUnitario = i.PrecioUnitario
         }).ToList(),
-        Total = dto.Items.Sum(i => i.Cantidad * i.PrecioUnitario), // Calcula el total automáticamente
+        Total = dto.Items.Sum(i => i.Cantidad * i.PrecioUnitario), 
         FechaVenta = DateTime.UtcNow
     };
 
@@ -1209,9 +1416,7 @@ app.MapPost("/api/ventas", async (HttpContext httpContext, [FromBody] CreateVent
     return Results.Created($"/api/ventas/{nuevaVenta.Id}", nuevaVenta);
 })
 .WithName("CreateVenta")
-.RequireAuthorization(); // <- Requiere estar logueado
-
-// 3. Obtener solo las compras/ventas del propio usuario
+.RequireAuthorization(); 
 app.MapGet("/api/ventas/mis-ventas", async (HttpContext httpContext, IMongoDatabase db) =>
 {
     var userId = httpContext.User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
@@ -1219,7 +1424,6 @@ app.MapGet("/api/ventas/mis-ventas", async (HttpContext httpContext, IMongoDatab
 
     var ventasCollection = db.GetCollection<VentaDocument>("ventas");
 
-    // Filtramos para que solo vea las de su propio ID
     var misVentas = await ventasCollection.Find(v => v.UserId == userId)
         .SortByDescending(v => v.FechaVenta)
         .ToListAsync();
@@ -1227,9 +1431,7 @@ app.MapGet("/api/ventas/mis-ventas", async (HttpContext httpContext, IMongoDatab
     return Results.Ok(misVentas);
 })
 .WithName("GetMisVentas")
-.RequireAuthorization(); // <- Requiere estar logueado
-
-// 4. Obtener TODAS las ventas realizadas en general (Para el panel de Admin)
+.RequireAuthorization(); 
 app.MapGet("/api/ventas", async (IMongoDatabase db) =>
 {
     var ventasCollection = db.GetCollection<VentaDocument>("ventas");
@@ -1242,6 +1444,80 @@ app.MapGet("/api/ventas", async (IMongoDatabase db) =>
 .WithName("GetAllVentas");
 
 app.Run();
+
+// ==========================================
+// FUNCIONES AUXILIARES DE CÁLCULO DE PRECIO
+// ==========================================
+
+static async Task<(List<ProductoMaterial> detalle, double precioBruto, string? error)> CalcularMateriales(
+    List<ProductoMaterialDto> materialesDto,
+    IMongoCollection<MaterialDocument> materialCollection)
+{
+    var detalle = new List<ProductoMaterial>();
+    double precioBruto = 0;
+
+    if (materialesDto is null || materialesDto.Count == 0)
+        return (detalle, 0, "El producto debe tener al menos un material.");
+
+    foreach (var item in materialesDto)
+    {
+        if (item.Cantidad <= 0)
+            return (detalle, 0, $"La cantidad del material {item.MaterialId} debe ser mayor a 0.");
+
+        var material = await materialCollection.Find(m => m.Id == item.MaterialId).FirstOrDefaultAsync();
+        if (material is null)
+            return (detalle, 0, $"El material con id {item.MaterialId} no existe.");
+
+        var subtotal = material.CostoUnitario * item.Cantidad;
+        precioBruto += subtotal;
+
+        detalle.Add(new ProductoMaterial
+        {
+            MaterialId = material.Id!,
+            NombreMaterial = material.Nombre,
+            Cantidad = item.Cantidad,
+            CostoUnitario = material.CostoUnitario,
+            Subtotal = Math.Round(subtotal, 2)
+        });
+    }
+
+    return (detalle, precioBruto, null);
+}
+
+static async Task<object?> RecalcularPrecioProducto(
+    string productoId,
+    IMongoCollection<ProductoDocument> productoCollection,
+    IMongoCollection<MaterialDocument> materialCollection)
+{
+    var producto = await productoCollection.Find(p => p.Id == productoId).FirstOrDefaultAsync();
+    if (producto is null)
+        return null;
+
+    var materialesDto = producto.Materiales
+        .Select(m => new ProductoMaterialDto(m.MaterialId, m.Cantidad))
+        .ToList();
+
+    var (detalle, precioBruto, error) = await CalcularMateriales(materialesDto, materialCollection);
+    if (error is not null)
+        return null;
+
+    var precioFinal = Math.Round(precioBruto * (1 + (producto.PorcentajeUtilidad / 100)), 2);
+
+    var update = Builders<ProductoDocument>.Update
+        .Set(p => p.Materiales, detalle)
+        .Set(p => p.PrecioBruto, Math.Round(precioBruto, 2))
+        .Set(p => p.PrecioFinal, precioFinal);
+
+    await productoCollection.UpdateOneAsync(p => p.Id == productoId, update);
+
+    return new
+    {
+        productoId,
+        precioBruto = Math.Round(precioBruto, 2),
+        precioFinal,
+        porcentajeUtilidad = producto.PorcentajeUtilidad
+    };
+}
 
 // ==========================================
 // DTOs (Data Transfer Objects)
@@ -1370,6 +1646,40 @@ public record SpotifyTokenDto(
 );
 
 public record GoogleAuthDto(string IdToken);
+
+public record CreateMaterialDto(
+    string Nombre,
+    string Descripcion,
+    double CostoUnitario,
+    string? Unidad = null,
+    int? Stock = null
+);
+
+public record UpdateMaterialDto(
+    string Nombre,
+    string Descripcion,
+    double CostoUnitario,
+    string? Unidad = null,
+    int? Stock = null
+);
+
+public record ProductoMaterialDto(string MaterialId, int Cantidad);
+
+public record CreateProductoDto(
+    string Nombre,
+    string Descripcion,
+    List<ProductoMaterialDto> Materiales,
+    double? PorcentajeUtilidad,
+    int? Stock
+);
+
+public record UpdateProductoDto(
+    string Nombre,
+    string Descripcion,
+    List<ProductoMaterialDto> Materiales,
+    double? PorcentajeUtilidad,
+    int? Stock
+);
 
 // ==========================================
 // DOCUMENT MODELS (MongoDB Collections)
@@ -1503,6 +1813,28 @@ public class RaspberryDocument
     public DateTime CreatedAt { get; set; }
 }
 
+public class MaterialDocument
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+    public string Nombre { get; set; } = null!;
+    public string Descripcion { get; set; } = null!;
+    public double CostoUnitario { get; set; }
+    public string Unidad { get; set; } = "pieza";
+    public int Stock { get; set; }
+    public DateTime CreatedAt { get; set; }
+}
+
+public class ProductoMaterial
+{
+    public string MaterialId { get; set; } = null!;
+    public string NombreMaterial { get; set; } = null!;
+    public int Cantidad { get; set; }
+    public double CostoUnitario { get; set; }
+    public double Subtotal { get; set; }
+}
+
 public class ProductoDocument
 {
     [BsonId]
@@ -1510,7 +1842,11 @@ public class ProductoDocument
     public string? Id { get; set; }
     public string Nombre { get; set; } = null!;
     public string Descripcion { get; set; } = null!;
-    public double Precio { get; set; }
+    public List<ProductoMaterial> Materiales { get; set; } = new();
+    public double PorcentajeUtilidad { get; set; } = 20;
+    public double PrecioBruto { get; set; }
+    public double PrecioFinal { get; set; }
+
     public int Stock { get; set; }
     public DateTime CreatedAt { get; set; }
 }
